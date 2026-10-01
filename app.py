@@ -446,13 +446,6 @@ with st.sidebar:
         step=1.0,
         help="Tel deze offset op bij de tijden van de PT100-scan als de klokken verschillen.",
     )
-    max_delta_s = st.number_input(
-        "Max. tijdsverschil [s]",
-        value=30.0,
-        min_value=1.0,
-        step=5.0,
-        help="Elke PT100-scan wordt gekoppeld aan de dichtstbijzijnde referentiemeting.",
-    )
 
     st.divider()
     st.header("Stabiele blokken")
@@ -686,7 +679,6 @@ try:
         df2_in_range,
         selected_channels,
         pt100_offset_seconds=0.0,
-        max_delta_seconds=float(max_delta_s),
     )
 except Exception as exc:  # noqa: BLE001
     st.error(f"Koppelen van de metingen is mislukt: {exc}")
@@ -694,8 +686,7 @@ except Exception as exc:  # noqa: BLE001
 
 if merged.empty:
     st.error(
-        "Geen overlappende tijdstippen binnen de max. tijdsverschil-instelling. "
-        "Vergroot het max. tijdsverschil of pas de offset aan."
+        "Geen overlappende tijdstippen. Pas de tijdspanne of de tijdoffset aan."
     )
     st.stop()
 
@@ -882,6 +873,13 @@ with tab_blokken:
             width="stretch",
             hide_index=True,
             column_config=_column_config(wide_display),
+        )
+        st.download_button(
+            "Download overzicht ΔT per kanaal (CSV)",
+            data=wide_display.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+            file_name="overzicht_delta_t.csv",
+            mime="text/csv",
+            key="download_overview_dt",
         )
 
         st.subheader("Details per blok")

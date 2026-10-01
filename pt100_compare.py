@@ -368,7 +368,7 @@ def _nearest_join(
     right: pd.DataFrame,
     *,
     on: str,
-    max_delta_seconds: float,
+    max_delta_seconds: float | None = None,
 ) -> pd.DataFrame:
     """Nearest-time join without pandas.merge_asof (crashes on Python 3.14)."""
     if left.empty or right.empty:
@@ -379,7 +379,6 @@ def _nearest_join(
 
     left_ns = left[on].to_numpy(dtype="datetime64[ns]").astype(np.int64)
     right_ns = right[on].to_numpy(dtype="datetime64[ns]").astype(np.int64)
-    tol_ns = int(float(max_delta_seconds) * 1_000_000_000)
 
     idx = np.searchsorted(right_ns, left_ns, side="left")
     idx_lo = np.clip(idx - 1, 0, len(right_ns) - 1)
@@ -389,7 +388,11 @@ def _nearest_join(
     use_hi = delta_hi < delta_lo
     best = np.where(use_hi, idx_hi, idx_lo)
     best_delta = np.where(use_hi, delta_hi, delta_lo)
-    matched = best_delta <= tol_ns
+    if max_delta_seconds is None:
+        matched = np.ones(len(left_ns), dtype=bool)
+    else:
+        tol_ns = int(float(max_delta_seconds) * 1_000_000_000)
+        matched = best_delta <= tol_ns
 
     if not matched.any():
         return left.iloc[0:0].copy()
@@ -410,7 +413,7 @@ def merge_measurements(
     channels: list[str],
     *,
     pt100_offset_seconds: float = 0.0,
-    max_delta_seconds: float = 30.0,
+    max_delta_seconds: float | None = None,
 ) -> pd.DataFrame:
     """Koppel elke PT100-scan aan de dichtstbijzijnde referentiemeting."""
     left_cols = ["tijd", *[ch for ch in channels if ch in pt100.columns]]
