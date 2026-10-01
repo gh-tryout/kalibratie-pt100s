@@ -844,7 +844,7 @@ with tab_tabel:
     )
     st.download_button(
         "Download gekoppelde tabel (CSV)",
-        data=merged.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+        data=merged.to_csv(index=False, sep=";", decimal=".").encode("utf-8-sig"),
         file_name="vergelijking_pt100.csv",
         mime="text/csv",
     )
@@ -876,7 +876,7 @@ with tab_blokken:
         )
         st.download_button(
             "Download overzicht ΔT per kanaal (CSV)",
-            data=wide_display.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+            data=wide_display.to_csv(index=False, sep=";", decimal=".").encode("utf-8-sig"),
             file_name="overzicht_delta_t.csv",
             mime="text/csv",
             key="download_overview_dt",
