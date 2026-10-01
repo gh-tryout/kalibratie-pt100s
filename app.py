@@ -83,6 +83,16 @@ def _difference_columns(df: pd.DataFrame) -> list[str]:
     return [col for col in df.columns if str(col).startswith("ΔT")]
 
 
+def _csv_bytes(df: pd.DataFrame, difference_columns: list[str]) -> bytes:
+    """CSV met punt als decimaalteken; ΔT afgerond op 0,01 °C."""
+    out = df.copy()
+    for col in difference_columns:
+        if col not in out.columns:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce").round(2)
+    return out.to_csv(index=False, sep=";", decimal=".").encode("utf-8-sig")
+
+
 # Zelfde volgorde als de categorische kleuren van de overige Streamlit-grafieken.
 CHANNEL_COLORS = (
     "#0068c9",
@@ -844,7 +854,7 @@ with tab_tabel:
     )
     st.download_button(
         "Download gekoppelde tabel (CSV)",
-        data=merged.to_csv(index=False, sep=";", decimal=".").encode("utf-8-sig"),
+        data=_csv_bytes(merged, [col for col in merged.columns if str(col).startswith("d_")]),
         file_name="vergelijking_pt100.csv",
         mime="text/csv",
     )
@@ -876,7 +886,7 @@ with tab_blokken:
         )
         st.download_button(
             "Download overzicht ΔT per kanaal (CSV)",
-            data=wide_display.to_csv(index=False, sep=";", decimal=".").encode("utf-8-sig"),
+            data=_csv_bytes(wide_display, _difference_columns(wide_display)),
             file_name="overzicht_delta_t.csv",
             mime="text/csv",
             key="download_overview_dt",
