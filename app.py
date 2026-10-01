@@ -83,6 +83,34 @@ def _difference_columns(df: pd.DataFrame) -> list[str]:
     return [col for col in df.columns if str(col).startswith("ΔT")]
 
 
+def _round_differences_for_html(df: pd.DataFrame) -> pd.DataFrame:
+    """Rond kolommen met ΔT af op 0,01 °C voor het HTML-rapport."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        if "ΔT" not in str(col):
+            continue
+        numbers = pd.to_numeric(out[col], errors="coerce")
+        out[col] = ["" if pd.isna(value) else f"{float(value):.2f}" for value in numbers]
+    return out
+
+
+def _figure_with_rounded_differences(fig: go.Figure) -> go.Figure:
+    """Kopie van een ΔT-grafiek met y-waarden op 0,01 °C."""
+    clone = go.Figure(fig)
+    for trace in clone.data:
+        y = getattr(trace, "y", None)
+        if y is None:
+            continue
+        values = pd.to_numeric(pd.Series(list(y)), errors="coerce").to_numpy(dtype=float)
+        trace.y = np.round(values, 2)
+        template = getattr(trace, "hovertemplate", None)
+        if isinstance(template, str):
+            trace.hovertemplate = template.replace(".3f", ".2f")
+    return clone
+
+
 def _csv_bytes(df: pd.DataFrame, difference_columns: list[str]) -> bytes:
     """CSV met punt als decimaalteken; ΔT afgerond op 0,01 °C."""
     out = df.copy()
@@ -253,36 +281,45 @@ def build_report_html(
     fig_main: go.Figure,
     fig_diff: go.Figure,
     fig_blocks: go.Figure | None,
-    merged_display: pd.DataFrame,
     block_display: pd.DataFrame,
     wide_display: pd.DataFrame,
     diff_tol: float,
+    laborant: str,
+    referentie: str,
+    calibrator: str,
+    meetmiddel: str,
 ) -> str:
     chart_main = fig_main.to_html(full_html=False, include_plotlyjs="cdn")
-    chart_diff = fig_diff.to_html(full_html=False, include_plotlyjs=False)
+    chart_diff = _figure_with_rounded_differences(fig_diff).to_html(full_html=False, include_plotlyjs=False)
     chart_blocks = ""
     if fig_blocks is not None:
-        chart_blocks = fig_blocks.to_html(
+        chart_blocks = _figure_with_rounded_differences(fig_blocks).to_html(
             full_html=False,
             include_plotlyjs=False,
             div_id="delta_setpoints",
         ) + _hover_bind_script("delta_setpoints")
-    if not wide_display.empty:
+    wide_html = _round_differences_for_html(wide_display)
+    block_html = _round_differences_for_html(block_display)
+    if not wide_html.empty:
         blocks_section = f"""
-        <h2>Stabiele verschillen</h2>
+        <h2>Gemeten verschillen</h2>
         <p>Start na {settle_min:g} min inregeltijd; einde uiterlijk {end_margin:g} min
-        vóór het volgende setpoint. ΔT = PT100 − referentie.</p>
+        vóór het volgende setpoint. ΔT = PT100 − referentie, afgerond op 0,01 °C.</p>
         <h3>Overzicht ΔT per kanaal</h3>
         <p>Kleur volgens |ΔT| t.o.v. de tolerantie van {diff_tol:g} °C:
         lichtgroen &lt; 0,25×, geel 0,25–0,5×, oranje 0,5–1×, rood 1–2×, donkerrood &gt; 2×.</p>
-        {_mark_differences(wide_display, diff_tol).to_html(index=False, border=0, classes="data")}
+        {_mark_differences(wide_html, diff_tol).to_html(index=False, border=0, classes="data")}
         <h3>Details per blok</h3>
-        {_df_to_html_table(block_display)}
+        {_df_to_html_table(block_html)}
         <h3>ΔT per setpoint</h3>
         {chart_blocks}
         """
     else:
-        blocks_section = "<h2>Stabiele verschillen</h2><p><em>Geen stabiele blokken gevonden.</em></p>"
+        blocks_section = "<h2>Gemeten verschillen</h2><p><em>Geen stabiele blokken gevonden.</em></p>"
+
+    def meta_line(label: str, value: str) -> str:
+        text = value.strip() or "—"
+        return f"<div><strong>{html.escape(label)}:</strong> {html.escape(text)}</div>"
 
     return f"""<!DOCTYPE html>
 <html lang="nl">
@@ -305,6 +342,10 @@ def build_report_html(
 <body>
   <h1>PT100-kalibratie vs referentie</h1>
   <div class="meta">
+    {meta_line("Laborant", laborant)}
+    {meta_line("Referentie", referentie)}
+    {meta_line("Calibrator", calibrator)}
+    {meta_line("Gekalibreerd meetmiddel", meetmiddel)}
     <div><strong>Bestand 1 (referentie):</strong> {html.escape(path1_name)} · kanaal {html.escape(ref_label)}</div>
     <div><strong>Bestand 2 (PT100):</strong> {html.escape(path2_name)}</div>
     <div><strong>Tijdspanne:</strong> {html.escape(str(range_start))} → {html.escape(str(range_end))}</div>
@@ -314,8 +355,6 @@ def build_report_html(
   {chart_main}
   <h2>Verschillen (PT100 − referentie)</h2>
   {chart_diff}
-  <h2>Gekoppelde tabel</h2>
-  {_df_to_html_table(merged_display)}
   {blocks_section}
 </body>
 </html>
@@ -496,6 +535,25 @@ with st.sidebar:
         step=0.01,
         format="%.2f",
         help="In de overzichtstabel worden verschilwaarden gemarkeerd waarvan de absolute waarde groter is dan deze tolerantie.",
+    )
+
+    st.divider()
+    st.header("Rapport")
+    laborant = st.text_input("Laborant", key="rapport_laborant", help="Optioneel. Komt in het HTML-rapport.")
+    referentie = st.text_input(
+        "Referentie",
+        key="rapport_referentie",
+        help="Optioneel. Gebruikte referentie-apparatuur.",
+    )
+    calibrator = st.text_input(
+        "Calibrator",
+        key="rapport_calibrator",
+        help="Optioneel. Gebruikte calibrator.",
+    )
+    meetmiddel = st.text_input(
+        "Gekalibreerd meetmiddel",
+        key="rapport_meetmiddel",
+        help="Optioneel. Het meetmiddel dat gekalibreerd wordt.",
     )
 
 
@@ -817,19 +875,34 @@ report_html = build_report_html(
     fig_main=fig,
     fig_diff=fig_diff,
     fig_blocks=fig_blocks,
-    merged_display=display_df,
     block_display=block_display,
     wide_display=wide_display,
     diff_tol=float(diff_tol),
+    laborant=laborant,
+    referentie=referentie,
+    calibrator=calibrator,
+    meetmiddel=meetmiddel,
 )
 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-st.download_button(
-    "Download grafieken & tabellen (HTML)",
-    data=report_html.encode("utf-8"),
-    file_name=f"pt100_kalibratie_{stamp}.html",
-    mime="text/html",
-    help="Eén HTML-bestand met interactieve grafieken en alle tabellen.",
-)
+csv_col, html_col = st.columns(2)
+with csv_col:
+    st.download_button(
+        "Download gekoppelde tabel (CSV)",
+        data=_csv_bytes(merged, [col for col in merged.columns if str(col).startswith("d_")]),
+        file_name="vergelijking_pt100.csv",
+        mime="text/csv",
+        key="download_coupled_top",
+        help="Alleen de gekoppelde scans. ΔT is afgerond op 0,01 °C.",
+    )
+with html_col:
+    st.download_button(
+        "Download grafieken en verschillen (HTML)",
+        data=report_html.encode("utf-8"),
+        file_name=f"pt100_kalibratie_{stamp}.html",
+        mime="text/html",
+        key="download_report_html",
+        help="Grafieken en gemeten verschillen. ΔT is afgerond op 0,01 °C.",
+    )
 
 tab_grafiek, tab_tabel, tab_blokken = st.tabs(
     ["Temperatuur", "Gekoppelde tabel", "Stabiele verschillen"]
@@ -857,6 +930,7 @@ with tab_tabel:
         data=_csv_bytes(merged, [col for col in merged.columns if str(col).startswith("d_")]),
         file_name="vergelijking_pt100.csv",
         mime="text/csv",
+        key="download_coupled_tab",
     )
 
 with tab_blokken:
