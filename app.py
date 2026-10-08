@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import html
+import importlib
 import os
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -14,22 +16,32 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from pt100_compare import (
-    BLOCK_COLUMNS,
-    classify_file,
-    combine_pt100_measurements,
-    coupled_columns,
-    detect_stable_blocks,
-    filter_time_range,
-    format_for_display,
-    list_data_files,
-    load_measurement,
-    load_measurement_bytes,
-    merge_measurements,
-    shift_datetime_series,
-    valid_channels,
-    wide_delta_table,
-)
+# Streamlit Cloud houdt een eerder geladen module soms in het geheugen terwijl
+# app.py al wel de nieuwe versie is. Opnieuw laden voorkomt dan
+# "cannot import name ... from pt100_compare".
+try:
+    import pt100_compare as _pt100_compare
+
+    _pt100_compare = importlib.reload(_pt100_compare)
+    BLOCK_COLUMNS = _pt100_compare.BLOCK_COLUMNS
+    classify_file = _pt100_compare.classify_file
+    combine_pt100_measurements = _pt100_compare.combine_pt100_measurements
+    coupled_columns = _pt100_compare.coupled_columns
+    detect_stable_blocks = _pt100_compare.detect_stable_blocks
+    filter_time_range = _pt100_compare.filter_time_range
+    format_for_display = _pt100_compare.format_for_display
+    list_data_files = _pt100_compare.list_data_files
+    load_measurement = _pt100_compare.load_measurement
+    load_measurement_bytes = _pt100_compare.load_measurement_bytes
+    merge_measurements = _pt100_compare.merge_measurements
+    shift_datetime_series = _pt100_compare.shift_datetime_series
+    valid_channels = _pt100_compare.valid_channels
+    wide_delta_table = _pt100_compare.wide_delta_table
+except Exception:
+    st.set_page_config(page_title="PT100-kalibratie", layout="wide")
+    st.error("pt100_compare.py kon niet geladen worden.")
+    st.code(traceback.format_exc())
+    st.stop()
 
 st.set_page_config(
     page_title="PT100-kalibratie",
