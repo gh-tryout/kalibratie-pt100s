@@ -261,6 +261,56 @@ def load_measurement_bytes(filename: str, data: bytes) -> tuple[str, pd.DataFram
         return load_measurement(path)
 
 
+def combine_pt100_measurements(
+    parts: list[tuple[pd.DataFrame, list[str], dict[str, str]]],
+) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
+    """Voeg PT100-scans samen op tijdstip.
+
+    Hetzelfde kanaalnummer is hetzelfde kanaal. Bij een gelijk tijdstip blijft
+    de eerste eindige waarde staan. Kanalen die alleen in een later bestand
+    zitten, komen erbij.
+    """
+    if not parts:
+        return pd.DataFrame(columns=["tijd"]), [], {}
+    if len(parts) == 1:
+        frame, channels, labels = parts[0]
+        return frame, list(channels), dict(labels)
+
+    channels: list[str] = []
+    labels: dict[str, str] = {}
+    frames: list[pd.DataFrame] = []
+    for frame, frame_channels, frame_labels in parts:
+        for channel in frame_channels:
+            if channel not in labels:
+                channels.append(channel)
+                labels[channel] = frame_labels.get(channel, channel)
+        frames.append(frame)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    for channel in channels:
+        if channel not in combined.columns:
+            combined[channel] = np.nan
+    ns = combined["tijd"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    order = np.argsort(ns, kind="mergesort")
+    ns = ns[order]
+    taken = {col: combined[col].to_numpy().take(order) for col in ["tijd", *channels]}
+    if len(ns) <= 1 or bool(np.all(np.diff(ns) != 0)):
+        return pd.DataFrame(taken), channels, labels
+
+    starts = np.flatnonzero(np.r_[True, np.diff(ns) != 0]).astype(np.intp)
+    ends = np.r_[starts[1:], len(ns)].astype(np.intp)
+    reduced: dict[str, np.ndarray] = {}
+    for channel in channels:
+        values = pd.to_numeric(pd.Series(taken[channel]), errors="coerce").to_numpy(dtype=float)
+        picked = np.empty(len(starts), dtype=float)
+        for index, (start, end) in enumerate(zip(starts, ends)):
+            finite_idx = np.flatnonzero(np.isfinite(values[start:end]))
+            picked[index] = values[start + int(finite_idx[0])] if finite_idx.size else np.nan
+        reduced[channel] = picked
+    out = pd.DataFrame({"tijd": taken["tijd"][starts], **reduced})
+    return out, channels, labels
+
+
 def valid_channels(df: pd.DataFrame, channels: list[str]) -> list[str]:
     """Kanalen die echt meelopen. Een handvol open-kanaalpieken telt niet mee."""
     kept: list[str] = []
@@ -460,16 +510,16 @@ def detect_stable_blocks(
     *,
     temp_step: float = 1.0,
     temp_tolerance: float = 0.5,
-    settle_minutes: float = 5.0,
-    min_stable_minutes: float = 5.0,
-    end_margin_minutes: float = 2.0,
+    block_start_before_minutes: float = 15.0,
+    block_end_before_minutes: float = 2.0,
 ) -> pd.DataFrame:
     """Vind temperatuurplateaus op de referentie en gemiddel per PT100.
 
-    Stabiel venster, zelfde systematiek als de voorbeeldapp:
-    - start na ``settle_minutes`` (inregeltijd, daarna is de waarde stabiel)
-    - eindigt uiterlijk ``end_margin_minutes`` vóór het volgende setpoint
-      (compensatie voor klokken die niet synchroon lopen)
+    Het tijdblok ligt vast ten opzichte van het volgende setpoint:
+    - start ``block_start_before_minutes`` vóór dat setpoint
+    - eindigt ``block_end_before_minutes`` vóór dat setpoint
+    Zonder volgend setpoint geldt het einde van het plateau als anker.
+    Het venster blijft binnen het plateau, zodat de aanloop niet meetelt.
     """
     if merged.empty or "t_ref" not in merged.columns:
         return pd.DataFrame()
@@ -489,8 +539,8 @@ def detect_stable_blocks(
             start = i
 
     blocks: list[dict] = []
-    settle_ns = int(float(settle_minutes) * 60 * 1_000_000_000)
-    end_margin_ns = int(float(end_margin_minutes) * 60 * 1_000_000_000)
+    start_before_ns = int(float(block_start_before_minutes) * 60 * 1_000_000_000)
+    end_before_ns = int(float(block_end_before_minutes) * 60 * 1_000_000_000)
     accepted_setpoints: list[float] = []
 
     for p_idx, (i0, i1) in enumerate(plateaus):
@@ -505,19 +555,19 @@ def detect_stable_blocks(
         t1_ns = _ts_ns(t1)
         duration_min = (t1_ns - t0_ns) / 1_000_000_000 / 60.0
 
-        stable_start_ns = t0_ns + settle_ns
-        stable_end_ns = t1_ns
         next_start = None
+        anchor_ns = t1_ns
         for q in range(p_idx + 1, len(plateaus)):
             j0, _j1 = plateaus[q]
             next_sp = work.at[j0, "setpoint"]
             if next_sp is None or (isinstance(next_sp, float) and np.isnan(next_sp)):
                 continue
             next_start = work.at[j0, "tijd"]
-            next_start_ns = _ts_ns(next_start)
-            stable_end_ns = min(stable_end_ns, next_start_ns - end_margin_ns)
+            anchor_ns = _ts_ns(next_start)
             break
 
+        stable_start_ns = max(anchor_ns - start_before_ns, t0_ns)
+        stable_end_ns = min(anchor_ns - end_before_ns, t1_ns)
         if stable_end_ns <= stable_start_ns:
             continue
 
@@ -530,7 +580,7 @@ def detect_stable_blocks(
         s0_ns = _ts_ns(stable["tijd"].iloc[0])
         s1_ns = _ts_ns(stable["tijd"].iloc[-1])
         stable_min = (s1_ns - s0_ns) / 1_000_000_000 / 60.0
-        if len(stable) < 3 or stable_min < min_stable_minutes * 0.5:
+        if len(stable) < 3:
             continue
 
         prev_sp = accepted_setpoints[-1] if accepted_setpoints else None

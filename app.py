@@ -16,6 +16,8 @@ import streamlit as st
 
 from pt100_compare import (
     BLOCK_COLUMNS,
+    classify_file,
+    combine_pt100_measurements,
     coupled_columns,
     detect_stable_blocks,
     filter_time_range,
@@ -38,8 +40,8 @@ st.set_page_config(
 st.title("PT100-kalibratie vs referentie")
 st.caption(
     "Upload eerst de referentie-temperatuurmeter (bestand 1, DBF), kies een tijdspanne, "
-    "daarna de PT100-scan (bestand 2, maximaal 20 kanalen). "
-    "Stabiele blokken slaan de inregeltijd over en stoppen vóór het volgende setpoint, "
+    "daarna een of meer PT100-scans van het te kalibreren instrument. "
+    "Het tijdblok van elk setpoint stel je in met twee tijden vóór het volgende setpoint, "
     "zodat klokken niet synchroon hoeven te lopen."
 )
 
@@ -276,8 +278,8 @@ def build_report_html(
     ref_label: str,
     range_start,
     range_end,
-    settle_min: float,
-    end_margin: float,
+    block_start_before: float,
+    block_end_before: float,
     fig_main: go.Figure,
     fig_diff: go.Figure,
     fig_blocks: go.Figure | None,
@@ -303,8 +305,8 @@ def build_report_html(
     if not wide_html.empty:
         blocks_section = f"""
         <h2>Gemeten verschillen</h2>
-        <p>Start na {settle_min:g} min inregeltijd; einde uiterlijk {end_margin:g} min
-        vóór het volgende setpoint. ΔT = PT100 − referentie, afgerond op 0,01 °C.</p>
+        <p>Tijdblok van {block_start_before:g} tot {block_end_before:g} min vóór het
+        volgende setpoint. ΔT = PT100 − referentie, afgerond op 0,01 °C.</p>
         <h3>Overzicht ΔT per kanaal</h3>
         <p>Kleur volgens |ΔT| t.o.v. de tolerantie van {diff_tol:g} °C:
         lichtgroen &lt; 0,25×, geel 0,25–0,5×, oranje 0,5–1×, rood 1–2×, donkerrood &gt; 2×.</p>
@@ -347,7 +349,7 @@ def build_report_html(
     {meta_line("Calibrator", calibrator)}
     {meta_line("Gekalibreerd meetmiddel", meetmiddel)}
     <div><strong>Bestand 1 (referentie):</strong> {html.escape(path1_name)} · kanaal {html.escape(ref_label)}</div>
-    <div><strong>Bestand 2 (PT100):</strong> {html.escape(path2_name)}</div>
+    <div><strong>PT100:</strong> {html.escape(path2_name)}</div>
     <div><strong>Tijdspanne:</strong> {html.escape(str(range_start))} → {html.escape(str(range_end))}</div>
     <div><strong>Gegenereerd:</strong> {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}</div>
   </div>
@@ -433,29 +435,33 @@ with st.sidebar:
         st.rerun()
 
     name1 = ""
-    name2 = ""
     data1: bytes | None = None
-    data2: bytes | None = None
     selected_paths: list[Path] = []
+    pt100_uploads: list[tuple[str, bytes]] = []
+    ref_paths: list[Path] = []
+    pt100_paths: list[Path] = []
+    ref_error = ""
 
     if source_mode == "Uploaden":
-        st.caption("Upload eerst bestand 1 (referentie), kies een tijdspanne, daarna bestand 2 (PT100).")
+        st.caption("Upload eerst de referentie, kies een tijdspanne, daarna een of meer PT100-scans.")
         up1 = st.file_uploader(
-            "Bestand 1 — referentie",
+            "Referentie",
             type=["dbf", "csv", "txt", "dat"],
             key="upload_file_1",
         )
         up2 = st.file_uploader(
-            "Bestand 2 — PT100-scan",
-            type=["csv", "txt", "dat", "dbf"],
+            "PT100-scans",
+            type=["csv", "txt", "dat"],
             key="upload_file_2",
+            accept_multiple_files=True,
+            help="Meerdere bestanden van het te kalibreren instrument mogen. "
+            "Hetzelfde kanaalnummer wordt één kanaal. Gelijke tijdstippen worden één scan.",
         )
         if up1 is not None:
             name1 = up1.name
             data1 = up1.getvalue()
-        if up2 is not None:
-            name2 = up2.name
-            data2 = up2.getvalue()
+        if up2:
+            pt100_uploads = [(item.name, item.getvalue()) for item in up2]
     else:
         if "data_folder" not in st.session_state:
             st.session_state["data_folder"] = default_data_folder()
@@ -479,21 +485,42 @@ with st.sidebar:
             if not files:
                 st.warning("Geen .dbf, .csv of .txt bestanden gevonden.")
 
-        st.caption("Vink eerst de referentie aan, kies een tijdspanne, daarna de PT100-scan.")
+        st.caption(
+            "Vink de referentie aan en een of meer PT100-scans. "
+            "Hetzelfde kanaalnummer wordt één kanaal."
+        )
         checked: list[str] = []
         for path in files:
             if st.checkbox(path.name, key=f"file_{path.name}"):
                 checked.append(path.name)
         selection_order = _sync_selection_order(checked)
         selected_paths = [folder_path / name for name in selection_order]
+        unknown: list[str] = []
+        for path in selected_paths:
+            try:
+                kind = classify_file(path)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"{path.name}: {exc}")
+                continue
+            if kind == "referentie":
+                ref_paths.append(path)
+            elif kind == "pt100":
+                pt100_paths.append(path)
+            else:
+                unknown.append(path.name)
+        if unknown:
+            st.warning("Niet herkend als referentie of PT100: " + ", ".join(unknown))
+        if len(ref_paths) > 1:
+            ref_error = "Meerdere referentiebestanden aangevinkt. Laat één referentie aan."
+            st.error(ref_error)
 
     st.divider()
     st.header("Koppeling")
     offset_s = st.number_input(
-        "Tijdoffset bestand 2 [s]",
+        "Tijdoffset PT100 [s]",
         value=0.0,
         step=1.0,
-        help="Tel deze offset op bij de tijden van de PT100-scan als de klokken verschillen.",
+        help="Tel deze offset op bij de tijden van alle PT100-bestanden als de klokken verschillen.",
     )
 
     st.divider()
@@ -512,22 +539,27 @@ with st.sidebar:
         step=0.05,
         help="Alleen metingen binnen deze afstand van een setpoint horen bij dat blok.",
     )
-    settle_min = st.number_input(
-        "Inregeltijd overslaan [min]",
-        value=5.0,
+    block_start_before = st.number_input(
+        "Tijdblok start vóór volgend setpoint [min]",
+        value=15.0,
         min_value=0.0,
         step=1.0,
-        help="Het stabiele venster begint pas na deze inregeltijd.",
+        help="Het tijdblok begint zoveel minuten vóór de start van het volgende setpoint. "
+        "Bij het laatste setpoint geldt het einde van dat plateau.",
     )
-    end_margin = st.number_input(
-        "Einde vóór volgende setpoint [min]",
+    block_end_before = st.number_input(
+        "Tijdblok einde vóór volgend setpoint [min]",
         value=2.0,
         min_value=0.0,
         step=0.5,
-        help="Het stabiele venster eindigt uiterlijk zoveel minuten vóór het volgende setpoint "
-        "(compensatie voor niet-synchrone klokken).",
+        help="Het tijdblok eindigt zoveel minuten vóór de start van het volgende setpoint. "
+        "Dit compenseert klokken die niet synchroon lopen.",
     )
-    min_stable = st.number_input("Minimale stabiele duur [min]", value=5.0, min_value=1.0, step=1.0)
+    time_block_valid = float(block_start_before) > float(block_end_before)
+    if not time_block_valid:
+        st.error(
+            "De start moet verder vóór het volgende setpoint liggen dan het einde."
+        )
     diff_tol = st.number_input(
         "Tolerantie verschil [°C]",
         value=0.05,
@@ -568,13 +600,13 @@ if source_mode == "Uploaden":
         st.stop()
     label1_name = name1
 else:
-    if not selected_paths:
+    if ref_error:
+        st.error(ref_error)
+        st.stop()
+    if not ref_paths:
         st.info("Selecteer in de zijbalk een datamap en vink het referentiebestand aan.")
         st.stop()
-    if len(selected_paths) > 2:
-        st.warning("Maximaal twee bestanden. Alleen de eerste twee worden gebruikt.")
-        selected_paths = selected_paths[:2]
-    path1 = selected_paths[0]
+    path1 = ref_paths[0]
     try:
         kind1, df1_all, ref_channels, ref_labels = cached_load(str(path1), path1.stat().st_mtime)
     except Exception as exc:  # noqa: BLE001
@@ -671,53 +703,73 @@ with tab_table1:
 if not ref_has_data:
     st.stop()
 
+pt100_parts: list[tuple[pd.DataFrame, list[str], dict[str, str]]] = []
+pt100_names: list[str] = []
 if source_mode == "Uploaden":
-    if data2 is None:
-        st.info("Upload nu de PT100-scan in de zijbalk om te vergelijken.")
+    if not pt100_uploads:
+        st.info("Upload nu een of meer PT100-scans in de zijbalk om te vergelijken.")
         st.stop()
-    try:
-        kind2, df2, pt_channels, pt_labels = cached_load_bytes(name2, data2)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"{name2}: {exc}")
-        st.stop()
-    label2_name = name2
+    sources = pt100_uploads
 else:
-    if len(selected_paths) < 2:
-        st.info("Vink nu de PT100-scan aan om te vergelijken binnen de gekozen tijdspanne.")
+    if not pt100_paths:
+        st.info("Vink nu een of meer PT100-scans aan om te vergelijken binnen de gekozen tijdspanne.")
         st.stop()
-    path2 = selected_paths[1]
-    try:
-        kind2, df2, pt_channels, pt_labels = cached_load(str(path2), path2.stat().st_mtime)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"{path2.name}: {exc}")
+    sources = [(path.name, path) for path in pt100_paths]
+
+for source in sources:
+    if source_mode == "Uploaden":
+        source_name, source_data = source
+        try:
+            kind2, frame, channels, labels = cached_load_bytes(source_name, source_data)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"{source_name}: {exc}")
+            st.stop()
+    else:
+        source_name, source_path = source
+        try:
+            kind2, frame, channels, labels = cached_load(str(source_path), source_path.stat().st_mtime)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"{source_name}: {exc}")
+            st.stop()
+    if kind2 != "pt100":
+        st.error(
+            f"{source_name} is geen PT100-scan. "
+            "Gebruik de Keysight-export met de temperatuurkanalen van het te kalibreren instrument."
+        )
         st.stop()
-    label2_name = path2.name
+    pt100_names.append(source_name)
+    pt100_parts.append((frame, channels, labels))
 
-if kind2 != "pt100":
-    st.error(
-        f"{label2_name} is geen PT100-scan. "
-        "Bestand 2 moet de Keysight-export zijn met maximaal 20 temperatuurkanalen."
-    )
-    st.stop()
-
-usable = valid_channels(df2, pt_channels)
-skipped = [ch for ch in pt_channels if ch not in usable]
-if len(usable) > 20:
-    st.warning("Meer dan 20 geldige PT100-kanalen; de eerste 20 worden gebruikt.")
-    usable = usable[:20]
+rows_before = sum(len(frame) for frame, _channels, _labels in pt100_parts)
+df2, pt_channels, pt_labels = combine_pt100_measurements(pt100_parts)
+label2_name = ", ".join(pt100_names)
+usable: list[str] = []
+for frame, channels, _labels in pt100_parts:
+    for channel in valid_channels(frame, channels):
+        if channel not in usable:
+            usable.append(channel)
+skipped = [channel for channel in pt_channels if channel not in usable]
 
 st.divider()
-st.subheader(f"2. Vergelijking met {label2_name}")
+if len(pt100_names) == 1:
+    st.subheader(f"2. Vergelijking met {pt100_names[0]}")
+else:
+    st.subheader(f"2. Vergelijking — {len(pt100_names)} PT100-bestanden")
 st.caption(
-    f"PT100-scan: {df2['tijd'].iloc[0]} → {df2['tijd'].iloc[-1]} · {len(df2)} scans"
+    f"{label2_name} · {df2['tijd'].iloc[0]} → {df2['tijd'].iloc[-1]} · {len(df2)} scans"
 )
+if rows_before > len(df2):
+    st.caption(
+        f"{rows_before - len(df2)} scans met hetzelfde tijdstip zijn samengevoegd. "
+        "Bij twee waarden op dat tijdstip blijft de eerste eindige waarde staan."
+    )
 if skipped:
     st.caption(
         "Overgeslagen (geen geldige meting, open of overrange): "
         + ", ".join(pt_labels.get(ch, ch) for ch in skipped)
     )
 if not usable:
-    st.error("Bestand 2 bevat geen geldige PT100-temperaturen.")
+    st.error("De PT100-bestanden bevatten geen geldige temperaturen.")
     st.stop()
 
 selected_channels = st.multiselect(
@@ -725,7 +777,7 @@ selected_channels = st.multiselect(
     options=usable,
     default=usable,
     format_func=lambda ch: pt_labels.get(ch, ch),
-    help="Maximaal 20 kanalen. Open kanalen staan hier niet bij.",
+    help="Open kanalen staan hier niet bij. Hetzelfde kanaalnummer uit meerdere bestanden is één kanaal.",
 )
 if not selected_channels:
     st.warning("Kies minstens één PT100-kanaal.")
@@ -758,15 +810,17 @@ if merged.empty:
     )
     st.stop()
 
-blocks = detect_stable_blocks(
-    merged,
-    selected_channels,
-    temp_step=float(temp_step),
-    temp_tolerance=float(temp_tol),
-    settle_minutes=float(settle_min),
-    min_stable_minutes=float(min_stable),
-    end_margin_minutes=float(end_margin),
-)
+if time_block_valid:
+    blocks = detect_stable_blocks(
+        merged,
+        selected_channels,
+        temp_step=float(temp_step),
+        temp_tolerance=float(temp_tol),
+        block_start_before_minutes=float(block_start_before),
+        block_end_before_minutes=float(block_end_before),
+    )
+else:
+    blocks = pd.DataFrame()
 n_windows = 0 if blocks.empty else int(_unique_windows(blocks).shape[0])
 
 info1, info2, info3, info4 = st.columns(4)
@@ -870,8 +924,8 @@ report_html = build_report_html(
     ref_label=ref_label,
     range_start=range_start,
     range_end=range_end,
-    settle_min=float(settle_min),
-    end_margin=float(end_margin),
+    block_start_before=float(block_start_before),
+    block_end_before=float(block_end_before),
     fig_main=fig,
     fig_diff=fig_diff,
     fig_blocks=fig_blocks,
@@ -935,14 +989,17 @@ with tab_tabel:
 
 with tab_blokken:
     st.markdown(
-        "Verschil **ΔT = PT100 − referentie** over het **stabiele** deel van elk temperatuursetpoint:\n"
-        f"- start na **{settle_min:g} min** inregeltijd\n"
-        f"- eindigt uiterlijk **{end_margin:g} min** vóór het volgende setpoint "
-        "(klokken niet synchroon)"
+        "Verschil **ΔT = PT100 − referentie** over het tijdblok van elk temperatuursetpoint, "
+        f"van **{block_start_before:g}** tot **{block_end_before:g} min** vóór het volgende setpoint. "
+        "Bij het laatste setpoint geldt het einde van dat plateau."
     )
-    if blocks.empty:
+    if not time_block_valid:
+        st.error(
+            "Het tijdblok is ongeldig. Zet de start verder vóór het volgende setpoint dan het einde."
+        )
+    elif blocks.empty:
         st.warning(
-            "Geen stabiele blokken gevonden. Verlaag de inregeltijd of de eindmarge, "
+            "Geen stabiele blokken gevonden. Zet de start van het tijdblok verder vóór het volgende setpoint, "
             "of vergroot de temperatuurtolerantie of de temperatuurstap."
         )
     else:
