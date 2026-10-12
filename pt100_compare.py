@@ -249,7 +249,8 @@ def load_measurement(path: str | Path) -> tuple[str, pd.DataFrame, list[str], di
         return kind, frame, channels, labels
     raise ValueError(
         f"Bestandstype niet herkend: {path.name}. "
-        "Bestand 1 is een DBF van de referentie-meter, bestand 2 een PT100-scan (CSV)."
+        "Bestand 1 is een DBF van de referentie-meter. "
+        "Bestand 2 is een PT100-scan (CSV) of een tweede referentie-DBF."
     )
 
 
@@ -309,6 +310,26 @@ def combine_pt100_measurements(
         reduced[channel] = picked
     out = pd.DataFrame({"tijd": taken["tijd"][starts], **reduced})
     return out, channels, labels
+
+
+def as_single_channel_measurement(
+    frame: pd.DataFrame,
+    channel: str,
+    labels: dict[str, str],
+    channel_id: str,
+) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
+    """Maak van een referentie-DBF één meetkanaal voor de vergelijking."""
+    if channel not in frame.columns:
+        raise ValueError(f"Kanaal {channel} ontbreekt in de meting.")
+    source_label = labels.get(channel, channel)
+    display = f"{channel_id} ({source_label})"
+    out = pd.DataFrame(
+        {
+            "tijd": frame["tijd"].to_numpy(),
+            channel_id: pd.to_numeric(frame[channel], errors="coerce").to_numpy(dtype=float),
+        }
+    )
+    return out, [channel_id], {channel_id: display}
 
 
 def valid_channels(df: pd.DataFrame, channels: list[str]) -> list[str]:

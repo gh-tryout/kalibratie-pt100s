@@ -25,6 +25,7 @@ try:
     _pt100_compare = importlib.reload(_pt100_compare)
     BLOCK_COLUMNS = _pt100_compare.BLOCK_COLUMNS
     classify_file = _pt100_compare.classify_file
+    as_single_channel_measurement = _pt100_compare.as_single_channel_measurement
     combine_pt100_measurements = _pt100_compare.combine_pt100_measurements
     coupled_columns = _pt100_compare.coupled_columns
     detect_stable_blocks = _pt100_compare.detect_stable_blocks
@@ -52,7 +53,7 @@ st.set_page_config(
 st.title("PT100-kalibratie vs referentie")
 st.caption(
     "Upload eerst de referentie-temperatuurmeter (bestand 1, DBF), kies een tijdspanne, "
-    "daarna een of meer PT100-scans van het te kalibreren instrument. "
+    "daarna een of meer PT100-scans of een tweede referentie (DBF, één kanaal). "
     "Het tijdblok van elk setpoint stel je in met twee tijden vóór het volgende setpoint, "
     "zodat klokken niet synchroon hoeven te lopen."
 )
@@ -425,6 +426,17 @@ def cached_load_bytes(filename: str, data: bytes):
     return load_measurement_bytes(filename, data)
 
 
+def _measurement_channel_id(source_name: str, used: set[str]) -> str:
+    stem = Path(source_name).stem.strip() or "meting"
+    candidate = stem
+    n = 2
+    while candidate in used:
+        candidate = f"{stem} ({n})"
+        n += 1
+    used.add(candidate)
+    return candidate
+
+
 def _sync_selection_order(checked_names: list[str]) -> list[str]:
     order: list[str] = list(st.session_state.get("selection_order", []))
     order = [name for name in order if name in checked_names]
@@ -495,19 +507,22 @@ with st.sidebar:
     ref_error = ""
 
     if source_mode == "Uploaden":
-        st.caption("Upload eerst de referentie, kies een tijdspanne, daarna een of meer PT100-scans.")
+        st.caption(
+            "Upload eerst de referentie, kies een tijdspanne, daarna PT100-scans (CSV) "
+            "of een tweede referentie (DBF)."
+        )
         up1 = st.file_uploader(
             "Referentie",
             type=["dbf", "csv", "txt", "dat"],
             key="upload_file_1",
         )
         up2 = st.file_uploader(
-            "PT100-scans",
-            type=["csv", "txt", "dat"],
+            "Metingen",
+            type=["csv", "txt", "dat", "dbf"],
             key="upload_file_2",
             accept_multiple_files=True,
-            help="Meerdere bestanden van het te kalibreren instrument mogen. "
-            "Hetzelfde kanaalnummer wordt één kanaal. Gelijke tijdstippen worden één scan.",
+            help="CSV: PT100-scan. Hetzelfde kanaalnummer wordt één kanaal. "
+            "DBF: tweede referentie, verder behandeld als één meetkanaal.",
         )
         if up1 is not None:
             name1 = up1.name
@@ -538,8 +553,9 @@ with st.sidebar:
                 st.warning("Geen .dbf, .csv of .txt bestanden gevonden.")
 
         st.caption(
-            "Vink de referentie aan en een of meer PT100-scans. "
-            "Hetzelfde kanaalnummer wordt één kanaal."
+            "Vink eerst de referentie (DBF) aan. Daarna een of meer PT100-scans, "
+            "of een extra DBF als tweede referentie. Die telt als één meetkanaal. "
+            "Hetzelfde kanaalnummer uit CSV-bestanden wordt één kanaal."
         )
         checked: list[str] = []
         for path in files:
@@ -555,16 +571,16 @@ with st.sidebar:
                 st.error(f"{path.name}: {exc}")
                 continue
             if kind == "referentie":
-                ref_paths.append(path)
+                if not ref_paths:
+                    ref_paths.append(path)
+                else:
+                    pt100_paths.append(path)
             elif kind == "pt100":
                 pt100_paths.append(path)
             else:
                 unknown.append(path.name)
         if unknown:
-            st.warning("Niet herkend als referentie of PT100: " + ", ".join(unknown))
-        if len(ref_paths) > 1:
-            ref_error = "Meerdere referentiebestanden aangevinkt. Laat één referentie aan."
-            st.error(ref_error)
+            st.warning("Niet herkend als referentie of meting: " + ", ".join(unknown))
 
     st.divider()
     st.header("Koppeling")
@@ -572,7 +588,7 @@ with st.sidebar:
         "Tijdoffset PT100 [s]",
         value=0.0,
         step=1.0,
-        help="Tel deze offset op bij de tijden van alle PT100-bestanden als de klokken verschillen.",
+        help="Tel deze offset op bij de tijden van de meting (PT100-scan of tweede referentie) als de klokken verschillen.",
     )
 
     st.divider()
@@ -783,14 +799,15 @@ if not ref_has_data:
 
 pt100_parts: list[tuple[pd.DataFrame, list[str], dict[str, str]]] = []
 pt100_names: list[str] = []
+used_channel_ids: set[str] = set()
 if source_mode == "Uploaden":
     if not pt100_uploads:
-        st.info("Upload nu een of meer PT100-scans in de zijbalk om te vergelijken.")
+        st.info("Upload nu een PT100-scan (CSV) of een tweede referentie (DBF) in de zijbalk.")
         st.stop()
     sources = pt100_uploads
 else:
     if not pt100_paths:
-        st.info("Vink nu een of meer PT100-scans aan om te vergelijken binnen de gekozen tijdspanne.")
+        st.info("Vink nu een PT100-scan of een tweede referentie (DBF) aan.")
         st.stop()
     sources = [(path.name, path) for path in pt100_paths]
 
@@ -809,12 +826,28 @@ for source in sources:
         except Exception as exc:  # noqa: BLE001
             st.error(f"{source_name}: {exc}")
             st.stop()
-    if kind2 != "pt100":
+    if kind2 == "referentie":
+        if len(channels) > 1:
+            chosen = st.selectbox(
+                f"Kanaal {source_name}",
+                options=channels,
+                index=0,
+                format_func=lambda ch, names=labels: names.get(ch, ch),
+                key=f"meas_dbf_channel_{source_name}",
+                help="Dit DBF-bestand telt als één meetkanaal. Kies welk kanaal met de referentie wordt vergeleken.",
+            )
+        else:
+            chosen = channels[0]
+        channel_id = _measurement_channel_id(source_name, used_channel_ids)
+        frame, channels, labels = as_single_channel_measurement(frame, chosen, labels, channel_id)
+    elif kind2 != "pt100":
         st.error(
-            f"{source_name} is geen PT100-scan. "
-            "Gebruik de Keysight-export met de temperatuurkanalen van het te kalibreren instrument."
+            f"{source_name} is geen PT100-scan en geen referentie-DBF. "
+            "Gebruik een Keysight-export of een tweede referentiebestand."
         )
         st.stop()
+    else:
+        used_channel_ids.update(channels)
     pt100_names.append(source_name)
     pt100_parts.append((frame, channels, labels))
 
@@ -832,7 +865,7 @@ st.divider()
 if len(pt100_names) == 1:
     st.subheader(f"2. Vergelijking met {pt100_names[0]}")
 else:
-    st.subheader(f"2. Vergelijking — {len(pt100_names)} PT100-bestanden")
+    st.subheader(f"2. Vergelijking — {len(pt100_names)} meetbestanden")
 st.caption(
     f"{label2_name} · {df2['tijd'].iloc[0]} → {df2['tijd'].iloc[-1]} · {len(df2)} scans"
 )
@@ -847,15 +880,16 @@ if skipped:
         + ", ".join(pt_labels.get(ch, ch) for ch in skipped)
     )
 if not usable:
-    st.error("De PT100-bestanden bevatten geen geldige temperaturen.")
+    st.error("De meetbestanden bevatten geen geldige temperaturen.")
     st.stop()
 
 selected_channels = st.multiselect(
-    "PT100-kanalen in de vergelijking",
+    "Kanalen in de vergelijking",
     options=usable,
     default=usable,
     format_func=lambda ch: pt_labels.get(ch, ch),
-    help="Open kanalen staan hier niet bij. Hetzelfde kanaalnummer uit meerdere bestanden is één kanaal.",
+    help="Open kanalen staan hier niet bij. Een DBF-meting heeft één kanaal. "
+    "Hetzelfde kanaalnummer uit meerdere CSV-bestanden is één kanaal.",
 )
 if not selected_channels:
     st.warning("Kies minstens één PT100-kanaal.")
