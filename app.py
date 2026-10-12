@@ -82,6 +82,42 @@ def _column_config(df: pd.DataFrame) -> dict:
     return config
 
 
+def _replace_single_spikes(times, values, limit_c: float = 5.0) -> tuple[np.ndarray, int]:
+    """Vervang één losse uitschieter door lineaire interpolatie van de buren.
+
+    Een punt telt als spike als het meer dan ``limit_c`` °C van beide buren afwijkt
+    en die buren zelf hoogstens ``limit_c`` °C uit elkaar liggen.
+    """
+    y = np.asarray(values, dtype=float).copy()
+    n = len(y)
+    if n < 3:
+        return y, 0
+    t = pd.to_datetime(pd.Series(times)).to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    spike = np.zeros(n, dtype=bool)
+    for i in range(1, n - 1):
+        left, mid, right = y[i - 1], y[i], y[i + 1]
+        if not (np.isfinite(left) and np.isfinite(mid) and np.isfinite(right)):
+            continue
+        if abs(left - right) > limit_c:
+            continue
+        if abs(mid - left) > limit_c and abs(mid - right) > limit_c:
+            spike[i] = True
+    isolated = spike.copy()
+    if n > 2:
+        isolated[1:-1] &= ~spike[:-2] & ~spike[2:]
+    count = 0
+    for i in np.flatnonzero(isolated):
+        t0 = t[i - 1]
+        t1 = t[i + 1]
+        if t1 == t0:
+            y[i] = 0.5 * (y[i - 1] + y[i + 1])
+        else:
+            frac = (t[i] - t0) / (t1 - t0)
+            y[i] = y[i - 1] + frac * (y[i + 1] - y[i - 1])
+        count += 1
+    return y, int(count)
+
+
 def _to_py_dt(value) -> datetime:
     ts = pd.Timestamp(value)
     return ts.to_pydatetime().replace(tzinfo=None)
@@ -290,8 +326,10 @@ def build_report_html(
     ref_label: str,
     range_start,
     range_end,
-    block_start_before: float,
-    block_end_before: float,
+    max_rate: float,
+    min_stable: float,
+    calc_start: float,
+    calc_end: float,
     fig_main: go.Figure,
     fig_diff: go.Figure,
     fig_blocks: go.Figure | None,
@@ -317,8 +355,10 @@ def build_report_html(
     if not wide_html.empty:
         blocks_section = f"""
         <h2>Gemeten verschillen</h2>
-        <p>Tijdblok van {block_start_before:g} tot {block_end_before:g} min vóór het
-        volgende setpoint. ΔT = PT100 − referentie, afgerond op 0,01 °C.</p>
+        <p>Het einde van het setpoint is het moment dat de referentie sneller dan {max_rate:g} K/min
+        verandert, na minstens {min_stable:g} min stabiel. Het gemiddelde gebruikt
+        {calc_start:g} tot {calc_end:g} min vóór dat einde.
+        ΔT = PT100 − referentie, afgerond op 0,01 °C.</p>
         <h3>Overzicht ΔT per kanaal</h3>
         <p>Kleur volgens |ΔT| t.o.v. de tolerantie van {diff_tol:g} °C:
         lichtgroen &lt; 0,25×, geel 0,25–0,5×, oranje 0,5–1×, rood 1–2×, donkerrood &gt; 2×.</p>
@@ -551,27 +591,39 @@ with st.sidebar:
         step=0.05,
         help="Alleen metingen binnen deze afstand van een setpoint horen bij dat blok.",
     )
-    block_start_before = st.number_input(
-        "Tijdblok start vóór volgend setpoint [min]",
+    max_rate = st.number_input(
+        "Temperatuurverandering [K/min]",
+        value=0.1,
+        min_value=0.01,
+        step=0.01,
+        format="%.2f",
+        help="Bepaalt, samen met de minimale duur, het tijdstip waarop het systeem naar het volgende setpoint gaat. "
+        "Default 0,1 K/min over de laatste minuut.",
+    )
+    min_stable = st.number_input(
+        "Minimale stabiele duur [min]",
+        value=5.0,
+        min_value=1.0,
+        step=1.0,
+        help="Het setpoint-einde telt pas nadat de temperatuur minstens zo lang stabiel is geweest.",
+    )
+    calc_start_before = st.number_input(
+        "Berekening start vóór einde setpoint [min]",
         value=15.0,
         min_value=0.0,
         step=1.0,
-        help="Het tijdblok begint zoveel minuten vóór de start van het volgende setpoint. "
-        "Bij het laatste setpoint geldt het einde van dat plateau.",
+        help="Het gemiddelde begint zoveel minuten vóór het einde van het setpoint.",
     )
-    block_end_before = st.number_input(
-        "Tijdblok einde vóór volgend setpoint [min]",
+    calc_end_before = st.number_input(
+        "Berekening einde vóór einde setpoint [min]",
         value=2.0,
         min_value=0.0,
         step=0.5,
-        help="Het tijdblok eindigt zoveel minuten vóór de start van het volgende setpoint. "
-        "Dit compenseert klokken die niet synchroon lopen.",
+        help="Het gemiddelde stopt zoveel minuten vóór het einde van het setpoint.",
     )
-    time_block_valid = float(block_start_before) > float(block_end_before)
+    time_block_valid = float(calc_start_before) > float(calc_end_before)
     if not time_block_valid:
-        st.error(
-            "De start moet verder vóór het volgende setpoint liggen dan het einde."
-        )
+        st.error("De start van de berekening moet verder vóór het einde liggen dan het einde van de berekening.")
     diff_tol = st.number_input(
         "Tolerantie verschil [°C]",
         value=0.05,
@@ -682,11 +734,25 @@ if not ref_has_data:
 
 tab_preview, tab_table1 = st.tabs(["Voorbeeld referentie", "Tabel referentie"])
 with tab_preview:
+    remove_spikes = st.toggle(
+        "Spikes verwijderen",
+        key="remove_ref_spikes",
+        help="Vervang een enkele meetwaarde die meer dan 5 °C van beide buren afwijkt "
+        "door interpolatie. De buren moeten zelf binnen 5 °C van elkaar liggen.",
+    )
+    n_spikes = 0
+    if remove_spikes:
+        cleaned, n_spikes = _replace_single_spikes(df1["tijd"], df1["t"])
+        df1 = df1.copy()
+        df1["t"] = cleaned
+        df1_win = filter_time_range(df1, range_start, range_end)
+        st.caption(f"{n_spikes} losse uitschieters vervangen door interpolatie tussen de buren.")
+    preview_frame = df1_win.rename(columns={"t": ref_channel})
     fig1 = go.Figure()
     fig1.add_trace(
         go.Scatter(
-            x=df1_preview["tijd"],
-            y=df1_preview[ref_channel],
+            x=preview_frame["tijd"],
+            y=preview_frame[ref_channel],
             name=ref_label,
             mode="lines",
         )
@@ -703,7 +769,7 @@ with tab_preview:
 
 with tab_table1:
     preview_cols = [("tijd", "Tijd"), (ref_channel, f"{ref_label} [°C]")]
-    display1 = format_for_display(df1_preview, preview_cols)
+    display1 = format_for_display(preview_frame, preview_cols)
     st.dataframe(
         display1,
         width="stretch",
@@ -828,8 +894,10 @@ if time_block_valid:
         selected_channels,
         temp_step=float(temp_step),
         temp_tolerance=float(temp_tol),
-        block_start_before_minutes=float(block_start_before),
-        block_end_before_minutes=float(block_end_before),
+        max_rate_k_per_min=float(max_rate),
+        min_stable_minutes=float(min_stable),
+        calc_start_before_minutes=float(calc_start_before),
+        calc_end_before_minutes=float(calc_end_before),
     )
 else:
     blocks = pd.DataFrame()
@@ -936,8 +1004,10 @@ report_html = build_report_html(
     ref_label=ref_label,
     range_start=range_start,
     range_end=range_end,
-    block_start_before=float(block_start_before),
-    block_end_before=float(block_end_before),
+    max_rate=float(max_rate),
+    min_stable=float(min_stable),
+    calc_start=float(calc_start_before),
+    calc_end=float(calc_end_before),
     fig_main=fig,
     fig_diff=fig_diff,
     fig_blocks=fig_blocks,
@@ -1001,17 +1071,17 @@ with tab_tabel:
 
 with tab_blokken:
     st.markdown(
-        "Verschil **ΔT = PT100 − referentie** over het tijdblok van elk temperatuursetpoint, "
-        f"van **{block_start_before:g}** tot **{block_end_before:g} min** vóór het volgende setpoint. "
-        "Bij het laatste setpoint geldt het einde van dat plateau."
+        "Verschil **ΔT = PT100 − referentie**. Het einde van het setpoint is het moment dat de "
+        f"referentie sneller dan **{max_rate:g} K/min** verandert, na minstens **{min_stable:g} min** stabiel. "
+        f"Het gemiddelde loopt van **{calc_start_before:g}** tot **{calc_end_before:g} min** vóór dat einde."
     )
     if not time_block_valid:
         st.error(
-            "Het tijdblok is ongeldig. Zet de start verder vóór het volgende setpoint dan het einde."
+            "De berekening is ongeldig. Zet de start verder vóór het einde van het setpoint dan het einde."
         )
     elif blocks.empty:
         st.warning(
-            "Geen stabiele blokken gevonden. Zet de start van het tijdblok verder vóór het volgende setpoint, "
+            "Geen stabiele blokken gevonden. Verlaag de temperatuurverandering of de minimale stabiele duur, "
             "of vergroot de temperatuurtolerantie of de temperatuurstap."
         )
     else:

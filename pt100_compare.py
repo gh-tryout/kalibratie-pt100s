@@ -504,84 +504,105 @@ def nearest_setpoint(temp: float, step: float, tolerance: float) -> float | None
     return None
 
 
+def _rate_k_per_min(tijd_ns: np.ndarray, temp: np.ndarray, lookback_s: float = 60.0) -> tuple[np.ndarray, np.ndarray]:
+    """Verandering van de referentie over de voorgaande minuut, in K/min."""
+    lookback_ns = int(float(lookback_s) * 1_000_000_000)
+    earlier = np.searchsorted(tijd_ns, tijd_ns - lookback_ns, side="right") - 1
+    earlier = np.clip(earlier, 0, len(tijd_ns) - 1)
+    dt_min = (tijd_ns - tijd_ns[earlier]) / 1_000_000_000 / 60.0
+    delta = temp - temp[earlier]
+    rate = np.full(len(temp), np.nan, dtype=float)
+    usable = (dt_min >= 0.5) & np.isfinite(temp) & np.isfinite(temp[earlier])
+    rate[usable] = delta[usable] / dt_min[usable]
+    return rate, dt_min
+
+
 def detect_stable_blocks(
     merged: pd.DataFrame,
     channels: list[str],
     *,
     temp_step: float = 1.0,
     temp_tolerance: float = 0.5,
-    block_start_before_minutes: float = 15.0,
-    block_end_before_minutes: float = 2.0,
+    max_rate_k_per_min: float = 0.1,
+    min_stable_minutes: float = 5.0,
+    calc_start_before_minutes: float = 15.0,
+    calc_end_before_minutes: float = 2.0,
 ) -> pd.DataFrame:
-    """Vind temperatuurplateaus op de referentie en gemiddel per PT100.
+    """Vind temperatuurplateaus en gemiddel over een venster vóór het einde.
 
-    Het tijdblok ligt vast ten opzichte van het volgende setpoint:
-    - start ``block_start_before_minutes`` vóór dat setpoint
-    - eindigt ``block_end_before_minutes`` vóór dat setpoint
-    Zonder volgend setpoint geldt het einde van het plateau als anker.
-    Het venster blijft binnen het plateau, zodat de aanloop niet meetelt.
+    De temperatuurverandering en de minimale duur bepalen het tijdstip waarop
+    het systeem naar het volgende setpoint gaat. Het gemiddelde gebruikt alleen
+    het stuk van ``calc_start_before_minutes`` tot ``calc_end_before_minutes``
+    vóór dat tijdstip.
     """
     if merged.empty or "t_ref" not in merged.columns:
         return pd.DataFrame()
 
     work = merged.sort_values("tijd").reset_index(drop=True)
-    assigned = [
-        nearest_setpoint(v, temp_step, temp_tolerance) for v in work["t_ref"].to_numpy(dtype=float)
-    ]
-    work["setpoint"] = pd.Series(assigned, dtype="object")
+    tijd_ns = work["tijd"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
+    ref_all = work["t_ref"].to_numpy(dtype=float)
+    rate, _dt_min = _rate_k_per_min(tijd_ns, ref_all)
+    stable_point = np.isfinite(ref_all) & np.isfinite(rate) & (np.abs(rate) < float(max_rate_k_per_min))
+    gap_min = np.zeros(len(work), dtype=float)
+    if len(work) > 1:
+        gap_min[1:] = (tijd_ns[1:] - tijd_ns[:-1]) / 1_000_000_000 / 60.0
 
-    plateaus: list[tuple[int, int]] = []
-    start = 0
+    runs: list[tuple[int, int]] = []
+    i = 0
     n = len(work)
-    for i in range(1, n + 1):
-        if i == n or work.at[i, "setpoint"] != work.at[start, "setpoint"]:
-            plateaus.append((start, i))
-            start = i
+    while i < n:
+        if not stable_point[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and stable_point[j + 1] and gap_min[j + 1] <= 3.0:
+            j += 1
+        duration_min = (tijd_ns[j] - tijd_ns[i]) / 1_000_000_000 / 60.0
+        if duration_min + 1e-9 >= float(min_stable_minutes) and (j - i + 1) >= 3:
+            runs.append((i, j))
+        i = j + 1
 
+    start_before_ns = int(float(calc_start_before_minutes) * 60 * 1_000_000_000)
+    end_before_ns = int(float(calc_end_before_minutes) * 60 * 1_000_000_000)
     blocks: list[dict] = []
-    start_before_ns = int(float(block_start_before_minutes) * 60 * 1_000_000_000)
-    end_before_ns = int(float(block_end_before_minutes) * 60 * 1_000_000_000)
     accepted_setpoints: list[float] = []
 
-    for p_idx, (i0, i1) in enumerate(plateaus):
-        sp = work.at[i0, "setpoint"]
-        if sp is None or (isinstance(sp, float) and np.isnan(sp)):
+    for i0, i1 in runs:
+        run = work.iloc[i0 : i1 + 1]
+        run_ref = run["t_ref"].to_numpy(dtype=float)
+        if int(np.isfinite(run_ref).sum()) < 3:
             continue
-        sp = float(sp)
-        block = work.iloc[i0:i1].reset_index(drop=True)
-        t0 = block["tijd"].iloc[0]
-        t1 = block["tijd"].iloc[-1]
-        t0_ns = _ts_ns(t0)
-        t1_ns = _ts_ns(t1)
-        duration_min = (t1_ns - t0_ns) / 1_000_000_000 / 60.0
-
-        next_start = None
-        anchor_ns = t1_ns
-        for q in range(p_idx + 1, len(plateaus)):
-            j0, _j1 = plateaus[q]
-            next_sp = work.at[j0, "setpoint"]
-            if next_sp is None or (isinstance(next_sp, float) and np.isnan(next_sp)):
-                continue
-            next_start = work.at[j0, "tijd"]
-            anchor_ns = _ts_ns(next_start)
-            break
-
-        stable_start_ns = max(anchor_ns - start_before_ns, t0_ns)
-        stable_end_ns = min(anchor_ns - end_before_ns, t1_ns)
-        if stable_end_ns <= stable_start_ns:
+        if i1 + 1 < n:
+            anchor_ns = int(tijd_ns[i1 + 1])
+            change_at = work["tijd"].iloc[i1 + 1]
+        else:
+            anchor_ns = int(tijd_ns[i1])
+            change_at = work["tijd"].iloc[i1]
+        calc_start_ns = anchor_ns - start_before_ns
+        calc_end_ns = anchor_ns - end_before_ns
+        if calc_end_ns <= calc_start_ns:
             continue
-
-        tijd_ns = block["tijd"].to_numpy(dtype="datetime64[ns]").astype(np.int64)
-        idxs = np.flatnonzero((tijd_ns >= stable_start_ns) & (tijd_ns <= stable_end_ns)).astype(np.intp)
-        if idxs.size == 0:
+        run_ns = tijd_ns[i0 : i1 + 1]
+        selected = np.flatnonzero((run_ns >= calc_start_ns) & (run_ns <= calc_end_ns)).astype(np.intp)
+        if selected.size < 3:
             continue
-
-        stable = pd.DataFrame({col: block[col].to_numpy().take(idxs) for col in block.columns})
+        stable = pd.DataFrame({col: run[col].to_numpy().take(selected) for col in run.columns})
+        ref = stable["t_ref"].to_numpy(dtype=float)
+        ref_ok = np.isfinite(ref)
+        if int(ref_ok.sum()) < 3:
+            continue
+        t_ref_mean = float(ref[ref_ok].mean())
+        run_mean = float(run_ref[np.isfinite(run_ref)].mean())
+        sp = nearest_setpoint(t_ref_mean, temp_step, temp_tolerance)
+        if sp is None:
+            sp = nearest_setpoint(run_mean, temp_step, temp_tolerance)
+        if sp is None:
+            continue
+        t_ref_std = float(ref[ref_ok].std(ddof=1)) if int(ref_ok.sum()) > 1 else 0.0
         s0_ns = _ts_ns(stable["tijd"].iloc[0])
         s1_ns = _ts_ns(stable["tijd"].iloc[-1])
         stable_min = (s1_ns - s0_ns) / 1_000_000_000 / 60.0
-        if len(stable) < 3:
-            continue
+        hold_min = (int(tijd_ns[i1]) - int(tijd_ns[i0])) / 1_000_000_000 / 60.0
 
         prev_sp = accepted_setpoints[-1] if accepted_setpoints else None
         if prev_sp is None:
@@ -594,21 +615,15 @@ def detect_stable_blocks(
             richting = "herhaal"
         accepted_setpoints.append(sp)
 
-        ref = stable["t_ref"].to_numpy(dtype=float)
-        ref_ok = np.isfinite(ref)
-        if int(ref_ok.sum()) < 3:
-            continue
-        t_ref_mean = float(ref[ref_ok].mean())
-        t_ref_std = float(ref[ref_ok].std(ddof=1)) if int(ref_ok.sum()) > 1 else 0.0
         common = {
             "setpoint": sp,
             "richting": richting,
-            "blok_start": t0,
-            "blok_einde": t1,
-            "volgende_blok": next_start,
+            "blok_start": run["tijd"].iloc[0],
+            "blok_einde": change_at,
+            "volgende_blok": change_at,
             "stabiel_van": stable["tijd"].iloc[0],
             "stabiel_tot": stable["tijd"].iloc[-1],
-            "blokduur_min": round(duration_min, 1),
+            "blokduur_min": round(hold_min, 1),
             "stabiel_min": round(stable_min, 1),
             "n_venster": int(len(stable)),
             "t_ref": t_ref_mean,
