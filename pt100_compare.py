@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import csv
+import html
 import io
+import math
+import operator
 import re
 import struct
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -548,6 +553,7 @@ def detect_stable_blocks(
     min_stable_minutes: float = 5.0,
     calc_start_before_minutes: float = 15.0,
     calc_end_before_minutes: float = 2.0,
+    progress=None,
 ) -> pd.DataFrame:
     """Vind temperatuurplateaus en gemiddel over een venster vóór het einde.
 
@@ -568,10 +574,19 @@ def detect_stable_blocks(
     if len(work) > 1:
         gap_min[1:] = (tijd_ns[1:] - tijd_ns[:-1]) / 1_000_000_000 / 60.0
 
+    def _tick(fraction: float, detail: str) -> None:
+        if progress is None:
+            return
+        progress(float(fraction), detail)
+
     runs: list[tuple[int, int]] = []
     i = 0
     n = len(work)
+    scan_step = max(n // 12, 1)
+    _tick(0.02, "punten nalopen")
     while i < n:
+        if progress is not None and i % scan_step == 0:
+            _tick(0.05 + 0.25 * (i / max(n, 1)), "punten nalopen")
         if not stable_point[i]:
             i += 1
             continue
@@ -587,8 +602,10 @@ def detect_stable_blocks(
     end_before_ns = int(float(calc_end_before_minutes) * 60 * 1_000_000_000)
     blocks: list[dict] = []
     accepted_setpoints: list[float] = []
+    run_total = max(len(runs), 1)
 
-    for i0, i1 in runs:
+    for run_index, (i0, i1) in enumerate(runs):
+        _tick(0.35 + 0.6 * (run_index / run_total), "tijdblokken")
         run = work.iloc[i0 : i1 + 1]
         run_ref = run["t_ref"].to_numpy(dtype=float)
         if int(np.isfinite(run_ref).sum()) < 3:
@@ -672,6 +689,7 @@ def detect_stable_blocks(
                 }
             )
 
+    _tick(1.0, "tijdblokken")
     return pd.DataFrame(blocks)
 
 
@@ -795,3 +813,753 @@ def wide_delta_table(blocks: pd.DataFrame, labels: dict[str, str]) -> pd.DataFra
             row[f"ΔT {label} [°C]"] = rec["d_t"]
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+class UncertaintyFormulaError(ValueError):
+    """De ingevoerde onzekerheidsformule is niet bruikbaar."""
+
+
+class UncertaintyFormula:
+    def __init__(self, expression: str, parameters: tuple[str, ...], error: str = ""):
+        self.expression = expression
+        self.parameters = parameters
+        self.error = error
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+class AssessmentTables:
+    def __init__(
+        self,
+        delta: pd.DataFrame,
+        u_measurement: pd.DataFrame,
+        u_total: pd.DataFrame,
+        judged: pd.DataFrame,
+        delta_columns: list[str],
+        uncertainty_columns: list[str],
+        judged_columns: list[str],
+        formula_was_negative: bool,
+        formula_not_finite: bool,
+        row_ids: list[str] | None = None,
+        formula_u: list[float] | None = None,
+        formula_columns: list[str] | None = None,
+    ):
+        self.delta = delta
+        self.u_measurement = u_measurement
+        self.u_total = u_total
+        self.judged = judged
+        self.delta_columns = delta_columns
+        self.uncertainty_columns = uncertainty_columns
+        self.judged_columns = judged_columns
+        self.formula_was_negative = formula_was_negative
+        self.formula_not_finite = formula_not_finite
+        self.row_ids = row_ids or []
+        self.formula_u = formula_u or []
+        self.formula_columns = formula_columns or []
+
+
+_FORMULA_FUNCTIONS = {
+    "exp": math.exp,
+    "sqrt": math.sqrt,
+    "log": math.log,
+    "ln": math.log,
+    "log10": math.log10,
+    "abs": abs,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "pow": pow,
+}
+_FORMULA_CONSTANTS = {"e": math.e, "E": math.e, "pi": math.pi}
+_FORMULA_RESERVED = set(_FORMULA_FUNCTIONS) | set(_FORMULA_CONSTANTS) | {"T"}
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+}
+_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_JUDGEMENT_FAIL = "fail"
+_JUDGEMENT_BORDER = "border"
+FORMULA_U_COLUMN = "u formule [°C]"
+_FAIL_BG = "#8B0000"
+_FAIL_FG = "#ffffff"
+_BORDER_BG = "#f6b26b"
+_BORDER_FG = "#1a1a1a"
+
+
+def _normalize_uncertainty_expression(raw: str) -> str:
+    text = raw.strip()
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    text = text.replace("×", "*").replace("·", "*")
+    text = re.sub(r"^[uU]\s*=\s*", "", text)
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    placeholders: list[str] = []
+
+    def hold(match: re.Match[str]) -> str:
+        placeholders.append(match.group(0))
+        return f"#{len(placeholders) - 1}#"
+
+    text = re.sub(r"\d+(?:\.\d+)?[eE][+-]?\d+", hold, text)
+    text = text.replace("^", "**")
+    names = "|".join(sorted(_FORMULA_FUNCTIONS, key=len, reverse=True))
+    text = re.sub(rf"\b(?:{names})\b", hold, text)
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"(?<=\d)(?=[A-Za-z(])", "*", text)
+        text = re.sub(r"(?<=\))(?=[A-Za-z\d(])", "*", text)
+        text = re.sub(r"(?<=[A-Za-z])(?=\()", "*", text)
+        text = re.sub(r"(?<=[A-Za-z])(?=T\b)", "*", text)
+    for index, original in enumerate(placeholders):
+        text = text.replace(f"#{index}#", original)
+    return text
+
+
+def _formula_parameter_names(tree: ast.AST) -> tuple[str, ...]:
+    names: list[str] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id not in _FORMULA_RESERVED and node.id not in names:
+                names.append(node.id)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    return tuple(names)
+
+
+def parse_uncertainty_formula(raw: str) -> UncertaintyFormula:
+    """Lees een formule u(T). Leeg betekent u = 0.
+
+    T is de temperatuur. e is het grondtal van de natuurlijke logaritme.
+    aT+b en a*e^(-b*T) zijn allebei geldig.
+    """
+    if len(raw) > 300:
+        return UncertaintyFormula("", (), "De formule is te lang.")
+    if not raw.strip():
+        return UncertaintyFormula("0", (), "")
+    expression = _normalize_uncertainty_expression(raw)
+    if not expression:
+        return UncertaintyFormula("0", (), "")
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return UncertaintyFormula("", (), "De formule is niet geldig. Voorbeelden: a*T + b en a*e^(-b*T).")
+    parameters = _formula_parameter_names(tree)
+    try:
+        _eval_uncertainty(tree, {"T": 0.0, **_FORMULA_CONSTANTS, **{name: 0.0 for name in parameters}})
+    except UncertaintyFormulaError as exc:
+        return UncertaintyFormula("", (), str(exc))
+    except (ZeroDivisionError, OverflowError, ValueError):
+        pass
+    return UncertaintyFormula(expression, parameters, "")
+
+
+def _eval_uncertainty(node: ast.AST, env: dict[str, float]) -> float:
+    if isinstance(node, ast.Expression):
+        return _eval_uncertainty(node.body, env)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            raise UncertaintyFormulaError("Alleen getallen zijn toegestaan.")
+        return float(node.value)
+    if isinstance(node, ast.Name):
+        if node.id not in env:
+            raise UncertaintyFormulaError(f"Onbekende naam '{node.id}'.")
+        return float(env[node.id])
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARYOPS:
+        return float(_UNARYOPS[type(node.op)](_eval_uncertainty(node.operand, env)))
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        left = _eval_uncertainty(node.left, env)
+        right = _eval_uncertainty(node.right, env)
+        return float(_BINOPS[type(node.op)](left, right))
+    if isinstance(node, ast.Call):
+        if node.keywords or not isinstance(node.func, ast.Name) or node.func.id not in _FORMULA_FUNCTIONS:
+            raise UncertaintyFormulaError("Deze functie is niet toegestaan. Gebruik exp, ln, log, log10, sqrt of abs.")
+        args = [_eval_uncertainty(arg, env) for arg in node.args]
+        try:
+            return float(_FORMULA_FUNCTIONS[node.func.id](*args))
+        except (TypeError, ValueError) as exc:
+            raise UncertaintyFormulaError(f"{node.func.id}() kan zo niet worden uitgerekend.") from exc
+    raise UncertaintyFormulaError("Dit onderdeel van de formule is niet toegestaan.")
+
+
+def evaluate_uncertainty(formula: UncertaintyFormula, temperature: float, parameters: dict[str, float]) -> float:
+    """Reken de formule uit bij één temperatuur. Het teken blijft behouden."""
+    if formula.error:
+        raise UncertaintyFormulaError(formula.error)
+    env = {"T": float(temperature), **_FORMULA_CONSTANTS}
+    for name in formula.parameters:
+        if name not in parameters:
+            raise UncertaintyFormulaError(f"Coëfficiënt {name} ontbreekt.")
+        env[name] = float(parameters[name])
+    tree = ast.parse(formula.expression, mode="eval")
+    try:
+        value = _eval_uncertainty(tree, env)
+    except ZeroDivisionError:
+        return float("nan")
+    except OverflowError:
+        return float("nan")
+    if not np.isfinite(value):
+        return float("nan")
+    return float(value)
+
+
+def uncertainty_formula_text(formula: UncertaintyFormula, parameters: dict[str, float]) -> str:
+    """Formule met ingevulde coëfficiënten, geschikt om te tonen."""
+    if not formula.ok:
+        return ""
+    text = formula.expression
+    for name in sorted(formula.parameters, key=len, reverse=True):
+        value = float(parameters.get(name, float("nan")))
+        text = re.sub(rf"\b{re.escape(name)}\b", f"({value:.6g})", text)
+    return "u = " + text.replace("**", "^")
+
+
+def judgement_mark(value, tolerance: float) -> str:
+    """'fail' boven de tolerantie, 'border' vanaf de helft tot en met de tolerantie."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(number):
+        return ""
+    limit = float(tolerance)
+    magnitude = abs(number)
+    if limit <= 0:
+        return _JUDGEMENT_FAIL if magnitude > 1e-12 else ""
+    if magnitude > limit + 1e-9:
+        return _JUDGEMENT_FAIL
+    if magnitude + 1e-9 >= 0.5 * limit:
+        return _JUDGEMENT_BORDER
+    return ""
+
+
+def _format_setpoint_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "n" in out.columns:
+        out["n"] = pd.to_numeric(out["n"], errors="coerce").round(0).astype("Int64")
+    if "T set [°C]" not in out.columns:
+        return out
+    numeric = pd.to_numeric(out["T set [°C]"], errors="coerce")
+    values = numeric.to_numpy(dtype=float)
+    if len(values) and np.isfinite(values).all() and np.allclose(values % 1, 0, atol=1e-6):
+        out["T set [°C]"] = numeric.round(0).astype("Int64")
+    return out
+
+
+def _assessment_row_id(first: pd.Series, index: int) -> str:
+    return f"{float(first['setpoint']):.6g}|{first['richting']}|{int(_ts_ns(first['stabiel_van']))}|{index}"
+
+
+def _grouped_block_rows(blocks: pd.DataFrame) -> list[tuple[pd.Series, dict[str, pd.Series]]]:
+    keys = ["setpoint", "richting", "stabiel_van", "stabiel_tot"]
+    grouped: dict[tuple, list[int]] = {}
+    for idx in range(len(blocks)):
+        key = tuple(blocks.iloc[idx][col] for col in keys)
+        grouped.setdefault(key, []).append(idx)
+    rows: list[tuple[pd.Series, dict[str, pd.Series]]] = []
+    for idxs in grouped.values():
+        first = blocks.iloc[idxs[0]]
+        by_channel = {str(blocks.iloc[idx]["kanaal"]): blocks.iloc[idx] for idx in idxs}
+        rows.append((first, by_channel))
+    return rows
+
+
+class AssessmentBase:
+    """ΔT en standaardonzekerheid per tijdblok, zonder de kalibratieformule.
+
+    Een formulewijziging of een handmatige cel hoeft dit niet opnieuw te maken.
+    """
+
+    def __init__(
+        self,
+        ident: pd.DataFrame,
+        delta: pd.DataFrame,
+        u_measurement: pd.DataFrame,
+        d_t: np.ndarray,
+        u_meas: np.ndarray,
+        temperatures: np.ndarray,
+        row_ids: list[str],
+        channels: list[str],
+        delta_columns: list[str],
+        uncertainty_columns: list[str],
+        formula_columns: list[str],
+    ):
+        self.ident = ident
+        self.delta = delta
+        self.u_measurement = u_measurement
+        self.d_t = d_t
+        self.u_meas = u_meas
+        self.temperatures = temperatures
+        self.row_ids = row_ids
+        self.channels = channels
+        self.delta_columns = delta_columns
+        self.uncertainty_columns = uncertainty_columns
+        self.formula_columns = formula_columns
+
+    @property
+    def ready(self) -> bool:
+        return len(self.row_ids) > 0 and len(self.channels) > 0
+
+
+def _assessment_column_names(
+    channels: list[str], labels: dict[str, str]
+) -> tuple[list[str], list[str], list[str]]:
+    delta_columns = [f"ΔT {labels.get(channel, channel)} [°C]" for channel in channels]
+    uncertainty_columns = [f"u {labels.get(channel, channel)} [°C]" for channel in channels]
+    formula_columns = [f"u formule {labels.get(channel, channel)} [°C]" for channel in channels]
+    return delta_columns, uncertainty_columns, formula_columns
+
+
+def _empty_assessment_tables(
+    delta_columns: list[str],
+    uncertainty_columns: list[str],
+    formula_columns: list[str],
+) -> AssessmentTables:
+    ident_columns = ["T set [°C]", "Richting", "T ref [°C]"]
+    judged_column_order = [column for pair in zip(formula_columns, delta_columns) for column in pair]
+    empty = pd.DataFrame(columns=[*ident_columns, *delta_columns])
+    empty_u = pd.DataFrame(columns=[*ident_columns, *uncertainty_columns])
+    empty_judged = pd.DataFrame(columns=[*ident_columns, *judged_column_order])
+    return AssessmentTables(
+        empty,
+        empty_u,
+        empty_u.copy(),
+        empty_judged,
+        delta_columns,
+        uncertainty_columns,
+        delta_columns,
+        False,
+        False,
+        formula_columns=formula_columns,
+    )
+
+
+def assessment_measurement_base(
+    blocks: pd.DataFrame,
+    channels: list[str],
+    labels: dict[str, str],
+) -> AssessmentBase:
+    """Eenmalig per meting: ΔT en u_meting = std(ΔT) / √n. Geen formule."""
+    channels = [str(channel) for channel in channels]
+    labels = {str(key): str(value) for key, value in labels.items()}
+    delta_columns, uncertainty_columns, formula_columns = _assessment_column_names(channels, labels)
+    grouped = _grouped_block_rows(blocks) if not blocks.empty and channels else []
+    row_count = len(grouped)
+    channel_count = len(channels)
+    d_t = np.full((row_count, channel_count), np.nan)
+    u_meas = np.full((row_count, channel_count), np.nan)
+    temperatures = np.full(row_count, np.nan)
+    row_ids: list[str] = []
+    ident_rows: list[dict] = []
+    for index, (first, by_channel) in enumerate(grouped):
+        row_ids.append(_assessment_row_id(first, index))
+        temperature = float(first["t_ref"])
+        temperatures[index] = temperature
+        ident_rows.append(
+            {
+                "T set [°C]": first["setpoint"],
+                "Richting": first["richting"],
+                "T ref [°C]": temperature,
+            }
+        )
+        for position, channel in enumerate(channels):
+            record = by_channel.get(channel)
+            if record is None:
+                continue
+            delta = float(record["d_t"])
+            count = float(record["n"])
+            std = float(record["std_d_t"])
+            d_t[index, position] = delta
+            if count > 0 and np.isfinite(std) and np.isfinite(count):
+                u_meas[index, position] = std / math.sqrt(count)
+    ident = _format_setpoint_frame(
+        pd.DataFrame(ident_rows, columns=["T set [°C]", "Richting", "T ref [°C]"])
+    )
+    delta_frame = ident.copy()
+    measurement_frame = ident.copy()
+    for position, column in enumerate(delta_columns):
+        delta_frame[column] = d_t[:, position] if row_count else np.array([], dtype=float)
+    for position, column in enumerate(uncertainty_columns):
+        measurement_frame[column] = u_meas[:, position] if row_count else np.array([], dtype=float)
+    return AssessmentBase(
+        ident,
+        delta_frame,
+        measurement_frame,
+        d_t,
+        u_meas,
+        temperatures,
+        row_ids,
+        channels,
+        delta_columns,
+        uncertainty_columns,
+        formula_columns,
+    )
+
+
+def formula_uncertainty_by_row(base: AssessmentBase, u_at_temperature=None) -> tuple[np.ndarray, bool, bool]:
+    """u(T) per tijdblok, vóór handmatige aanpassingen. Negatieve uitkomsten worden absoluut."""
+    values = np.full(len(base.row_ids), np.nan)
+    was_negative = False
+    not_finite = False
+    if u_at_temperature is None:
+        return values, was_negative, not_finite
+    for index, temperature in enumerate(base.temperatures):
+        if not np.isfinite(temperature):
+            continue
+        raw = float(u_at_temperature(float(temperature)))
+        if not np.isfinite(raw):
+            not_finite = True
+            continue
+        if raw < 0:
+            was_negative = True
+            raw = abs(raw)
+        values[index] = raw
+    return values, was_negative, not_finite
+
+
+def filter_uncertainty_overrides(
+    overrides: dict[str, float] | None,
+    row_ids: list[str],
+    channels: list[str],
+) -> dict[str, float]:
+    """Bewaar alleen sleutels 'rij|kanaal' die nog in de huidige tabellen staan."""
+    valid_rows = set(row_ids)
+    valid_channels = {str(channel) for channel in channels}
+    kept: dict[str, float] = {}
+    for key, value in (overrides or {}).items():
+        row_id, separator, channel = str(key).rpartition("|")
+        if not separator or row_id not in valid_rows or channel not in valid_channels:
+            continue
+        try:
+            number = abs(float(value))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            kept[f"{row_id}|{channel}"] = number
+    return kept
+
+
+def apply_uncertainty_overrides(
+    base: AssessmentBase,
+    formula_per_row: np.ndarray,
+    overrides: dict[str, float] | None,
+) -> np.ndarray:
+    """Matrix (rijen × kanalen) met de formule, en per cel een eventuele handmatige waarde."""
+    row_count = len(base.row_ids)
+    channel_count = len(base.channels)
+    if row_count == 0 or channel_count == 0:
+        return np.zeros((row_count, channel_count))
+    matrix = np.repeat(np.asarray(formula_per_row, dtype=float).reshape(row_count, 1), channel_count, axis=1)
+    for index, row_id in enumerate(base.row_ids):
+        for position, channel in enumerate(base.channels):
+            manual = (overrides or {}).get(f"{row_id}|{channel}")
+            if manual is None:
+                continue
+            try:
+                number = abs(float(manual))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                matrix[index, position] = number
+    return matrix
+
+
+def changed_uncertainty_rows(previous: np.ndarray | None, current: np.ndarray) -> list[int] | None:
+    """Rijnummers waarvan de kalibratie-onzekerheid veranderde.
+
+    None betekent dat elke rij opnieuw moet. Een lege lijst betekent dat er niets veranderde.
+    """
+    if previous is None or getattr(previous, "shape", None) != current.shape:
+        return None
+    if current.size == 0:
+        return []
+    same = np.isclose(previous, current, rtol=0.0, atol=5e-5, equal_nan=True)
+    if bool(same.all()):
+        return []
+    return np.flatnonzero(~np.all(same, axis=1)).tolist()
+
+
+def _judged_block(d_t: np.ndarray, u_total: np.ndarray) -> np.ndarray:
+    judged = np.full(d_t.shape, np.nan, dtype=float)
+    valid = np.isfinite(d_t) & np.isfinite(u_total)
+    judged = np.where(valid & (d_t > 0), d_t + u_total, judged)
+    judged = np.where(valid & (d_t < 0), d_t - u_total, judged)
+    judged = np.where(valid & (d_t == 0), 0.0, judged)
+    return judged
+
+
+def _uncertainty_block(u_cal: np.ndarray, u_meas: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(u_cal) & np.isfinite(u_meas)
+    return np.where(finite, u_cal + u_meas, np.nan)
+
+
+def _same_assessment_layout(previous: AssessmentTables | None, base: AssessmentBase) -> bool:
+    return (
+        previous is not None
+        and previous.row_ids == base.row_ids
+        and previous.formula_columns == base.formula_columns
+        and previous.delta_columns == base.delta_columns
+        and previous.uncertainty_columns == base.uncertainty_columns
+    )
+
+
+def assemble_assessment(
+    base: AssessmentBase,
+    u_calibration: np.ndarray,
+    formula_per_row: np.ndarray,
+    formula_was_negative: bool,
+    formula_not_finite: bool,
+    previous: AssessmentTables | None = None,
+    dirty_rows: list[int] | None = None,
+) -> AssessmentTables:
+    """Vul totale onzekerheid en beoordeeld verschil.
+
+    dirty_rows beperkt het schrijven tot die rijen. None vult alle rijen.
+    """
+    if not base.ready:
+        return _empty_assessment_tables(base.delta_columns, base.uncertainty_columns, base.formula_columns)
+    formula_values = [
+        float(value) if np.isfinite(value) else float("nan") for value in np.asarray(formula_per_row, dtype=float)
+    ]
+    if dirty_rows is not None and len(dirty_rows) == 0 and _same_assessment_layout(previous, base):
+        assert previous is not None
+        return AssessmentTables(
+            previous.delta,
+            previous.u_measurement,
+            previous.u_total,
+            previous.judged,
+            base.delta_columns,
+            base.uncertainty_columns,
+            base.delta_columns,
+            formula_was_negative,
+            formula_not_finite,
+            list(base.row_ids),
+            formula_values,
+            list(base.formula_columns),
+        )
+
+    full = (
+        dirty_rows is None
+        or not _same_assessment_layout(previous, base)
+        or len(dirty_rows) == len(base.row_ids)
+    )
+    positions = list(range(len(base.row_ids))) if full else [int(index) for index in dirty_rows or []]
+    selected = np.asarray(positions, dtype=int)
+    u_total = _uncertainty_block(u_calibration[selected], base.u_meas[selected])
+    judged = _judged_block(base.d_t[selected], u_total)
+
+    if full:
+        total_frame = base.ident.copy()
+        judged_frame = base.ident.copy()
+        for position, column in enumerate(base.uncertainty_columns):
+            total_frame[column] = u_total[:, position]
+        for position, (formula_column, delta_column) in enumerate(zip(base.formula_columns, base.delta_columns)):
+            judged_frame[formula_column] = u_calibration[:, position]
+            judged_frame[delta_column] = judged[:, position]
+    else:
+        assert previous is not None
+        total_frame = previous.u_total.copy()
+        judged_frame = previous.judged.copy()
+        total_locations = [total_frame.columns.get_loc(column) for column in base.uncertainty_columns]
+        formula_locations = [judged_frame.columns.get_loc(column) for column in base.formula_columns]
+        delta_locations = [judged_frame.columns.get_loc(column) for column in base.delta_columns]
+        for offset, row_index in enumerate(positions):
+            for position, location in enumerate(total_locations):
+                total_frame.iat[row_index, location] = float(u_total[offset, position])
+            for position, location in enumerate(formula_locations):
+                judged_frame.iat[row_index, location] = float(u_calibration[row_index, position])
+            for position, location in enumerate(delta_locations):
+                judged_frame.iat[row_index, location] = float(judged[offset, position])
+
+    return AssessmentTables(
+        base.delta,
+        base.u_measurement,
+        total_frame,
+        judged_frame,
+        base.delta_columns,
+        base.uncertainty_columns,
+        base.delta_columns,
+        formula_was_negative,
+        formula_not_finite,
+        list(base.row_ids),
+        formula_values,
+        list(base.formula_columns),
+    )
+
+
+def build_assessment_tables(
+    blocks: pd.DataFrame,
+    channels: list[str],
+    labels: dict[str, str],
+    u_at_temperature=None,
+    u_overrides: dict[str, float] | None = None,
+) -> AssessmentTables:
+    """Vier tabellen: ΔT, u van de meting, totale u, en het beoordeelde verschil.
+
+    Zonder tijden en zonder n. u_meting = std(ΔT) / √n van dat kanaal.
+    u_totaal = u_formule + u_meting. Een override vervangt u_formule voor die meetwaarde.
+    Het beoordeelde verschil is ΔT ± u_totaal, het teken volgt de afwijking.
+    """
+    base = assessment_measurement_base(blocks, channels, labels)
+    if not base.ready:
+        return _empty_assessment_tables(base.delta_columns, base.uncertainty_columns, base.formula_columns)
+    formula_per_row, was_negative, not_finite = formula_uncertainty_by_row(base, u_at_temperature)
+    kept = filter_uncertainty_overrides(u_overrides, base.row_ids, base.channels)
+    matrix = apply_uncertainty_overrides(base, formula_per_row, kept)
+    return assemble_assessment(base, matrix, formula_per_row, was_negative, not_finite)
+
+
+def _report_number(column: str, value) -> str:
+    if pd.isna(value):
+        return ""
+    if column == "Richting":
+        return str(value)
+    if column == "n":
+        return str(int(value))
+    number = float(value)
+    if not np.isfinite(number):
+        return ""
+    if column == "T set [°C]" and abs(number - round(number)) < 1e-6:
+        return str(int(round(number)))
+    if column == "T ref [°C]":
+        return f"{number:.3f}"
+    return f"{number:.4f}"
+
+
+def _report_table_html(df: pd.DataFrame, marks: dict[tuple[int, str], str] | None = None) -> str:
+    if df.empty:
+        return "<p><em>Geen gegevens</em></p>"
+    marks = marks or {}
+    header = "".join(f"<th>{html.escape(str(column))}</th>" for column in df.columns)
+    body: list[str] = []
+    for row_index, row in enumerate(df.itertuples(index=False)):
+        cells: list[str] = []
+        for column, value in zip(df.columns, row):
+            text = html.escape(_report_number(str(column), value))
+            mark = marks.get((row_index, str(column)), "")
+            if mark == _JUDGEMENT_FAIL:
+                cells.append(
+                    f'<td style="background-color:{_FAIL_BG};color:{_FAIL_FG}" bgcolor="{_FAIL_BG}">{text}</td>'
+                )
+            elif mark == _JUDGEMENT_BORDER:
+                cells.append(
+                    f'<td style="background-color:{_BORDER_BG};color:{_BORDER_FG}" bgcolor="{_BORDER_BG}">{text}</td>'
+                )
+            else:
+                cells.append(f"<td>{text}</td>")
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return (
+        '<table class="data" border="1" cellspacing="0" cellpadding="4">'
+        f"<thead><tr>{header}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+    )
+
+
+def _judgement_marks(df: pd.DataFrame, columns: list[str], tolerance: float) -> dict[tuple[int, str], str]:
+    marks: dict[tuple[int, str], str] = {}
+    for row_index in range(len(df)):
+        for column in columns:
+            if column not in df.columns:
+                continue
+            mark = judgement_mark(df.iloc[row_index][column], tolerance)
+            if mark:
+                marks[(row_index, column)] = mark
+    return marks
+
+
+def build_assessment_report_html(
+    *,
+    path1_name: str,
+    path2_name: str,
+    ref_label: str,
+    range_start,
+    range_end,
+    laborant: str,
+    referentie: str,
+    calibrator: str,
+    meetmiddel: str,
+    formula_text: str,
+    diff_tol: float,
+    tables: AssessmentTables,
+    max_rate: float,
+    min_stable: float,
+    calc_start: float,
+    calc_end: float,
+) -> str:
+    """HTML-kalibratierapport dat Word kan openen."""
+
+    def meta_line(label: str, value: str) -> str:
+        text = value.strip() or "—"
+        return f"<div><strong>{html.escape(label)}:</strong> {html.escape(text)}</div>"
+
+    notes: list[str] = []
+    if tables.formula_was_negative:
+        notes.append("Een negatieve uitkomst van de formule is als absolute waarde gebruikt.")
+    if tables.formula_not_finite:
+        notes.append("Voor minstens één temperatuur gaf de formule geen eindig getal.")
+    note_html = "".join(f"<p>{html.escape(note)}</p>" for note in notes)
+    judged_marks = _judgement_marks(tables.judged, tables.judged_columns, diff_tol)
+    return f"""<!DOCTYPE html>
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" lang="nl">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  <meta name="ProgId" content="Word.Document"/>
+  <title>Kalibratierapport PT100</title>
+  <!--[if gte mso 9]>
+  <xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml>
+  <![endif]-->
+  <style>
+    body {{ font-family: Calibri, Segoe UI, sans-serif; font-size: 11pt; color: #1a1a1a; margin: 24px; }}
+    h1 {{ font-size: 18pt; margin-bottom: 4pt; }}
+    h2 {{ font-size: 14pt; margin-top: 18pt; margin-bottom: 4pt; }}
+    .meta div {{ margin: 1pt 0; }}
+    table.data {{ border-collapse: collapse; margin: 6pt 0 14pt; }}
+    table.data td, table.data th {{ border: 1px solid #666666; padding: 3pt 6pt; font-size: 10pt; text-align: left; }}
+    table.data th {{ background: #f3f3f3; }}
+  </style>
+</head>
+<body>
+  <h1>Kalibratierapport PT100</h1>
+  <div class="meta">
+    {meta_line("Laborant", laborant)}
+    {meta_line("Referentie", referentie)}
+    {meta_line("Calibrator", calibrator)}
+    {meta_line("Gekalibreerd meetmiddel", meetmiddel)}
+    <div><strong>Bestand 1 (referentie):</strong> {html.escape(path1_name)} · kanaal {html.escape(ref_label)}</div>
+    <div><strong>Meting:</strong> {html.escape(path2_name)}</div>
+    <div><strong>Tijdspanne:</strong> {html.escape(str(range_start))} → {html.escape(str(range_end))}</div>
+    <div><strong>Tolerantie verschil:</strong> {diff_tol:g} °C</div>
+    <div><strong>Tijdblok:</strong> einde zodra de referentie sneller dan {max_rate:g} K/min verandert,
+    na minstens {min_stable:g} min stabiel. Gemiddelde van {calc_start:g} tot {calc_end:g} min vóór dat einde.</div>
+    <div><strong>Meetonzekerheid kalibratie:</strong> {html.escape(formula_text or "u = 0")}</div>
+    <div><strong>Gegenereerd:</strong> {html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}</div>
+  </div>
+  {note_html}
+  <h2>Gemeten verschil ΔT</h2>
+  <p>ΔT = PT100 − referentie, in °C. Eén rij per setpoint, zonder tijden.</p>
+  {_report_table_html(tables.delta)}
+  <h2>Standaardonzekerheid van de meting</h2>
+  <p>Standaarddeviatie van ΔT in het tijdblok, gedeeld door de wortel van het aantal waarnemingen van dat kanaal. Eenheid: °C.</p>
+  {_report_table_html(tables.u_measurement)}
+  <h2>Totale meetonzekerheid</h2>
+  <p>De onzekerheid uit de formule, uitgerekend bij de gemiddelde referentietemperatuur, opgeteld bij de standaardonzekerheid van de meting. Eenheid: °C.</p>
+  {_report_table_html(tables.u_total)}
+  <h2>Beoordeeld verschil</h2>
+  <p>Het gemeten verschil, met de totale meetonzekerheid opgeteld in de richting van de afwijking.
+  Een positief verschil wordt hoger en een negatief verschil lager.
+  Elke kolom u formule hoort bij de meetwaarde ernaast. Die komt uit de formule, of is met de hand ingevuld.
+  Donkerrood: de absolute waarde is groter dan de tolerantie van {diff_tol:g} °C.
+  Oranje: grensgeval, vanaf de helft van de tolerantie tot en met de tolerantie.</p>
+  {_report_table_html(tables.judged, judged_marks)}
+</body>
+</html>
+"""

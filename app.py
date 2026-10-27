@@ -6,6 +6,7 @@ import html
 import importlib
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,19 @@ try:
     shift_datetime_series = _pt100_compare.shift_datetime_series
     valid_channels = _pt100_compare.valid_channels
     wide_delta_table = _pt100_compare.wide_delta_table
+    parse_uncertainty_formula = _pt100_compare.parse_uncertainty_formula
+    evaluate_uncertainty = _pt100_compare.evaluate_uncertainty
+    uncertainty_formula_text = _pt100_compare.uncertainty_formula_text
+    build_assessment_tables = _pt100_compare.build_assessment_tables
+    assessment_measurement_base = _pt100_compare.assessment_measurement_base
+    formula_uncertainty_by_row = _pt100_compare.formula_uncertainty_by_row
+    filter_uncertainty_overrides = _pt100_compare.filter_uncertainty_overrides
+    apply_uncertainty_overrides = _pt100_compare.apply_uncertainty_overrides
+    changed_uncertainty_rows = _pt100_compare.changed_uncertainty_rows
+    assemble_assessment = _pt100_compare.assemble_assessment
+    judgement_mark = _pt100_compare.judgement_mark
+    build_assessment_report_html = _pt100_compare.build_assessment_report_html
+    UncertaintyFormulaError = _pt100_compare.UncertaintyFormulaError
 except Exception:
     st.set_page_config(page_title="PT100-kalibratie", layout="wide")
     st.error("pt100_compare.py kon niet geladen worden.")
@@ -219,6 +233,330 @@ def _mark_differences(df: pd.DataFrame, tolerance: float):
         return "background-color: #b71c1c; color: #ffffff"
 
     return df.style.map(paint, subset=columns)
+
+
+def _assessment_column_config(df: pd.DataFrame, value_format: str = "%.4f") -> dict:
+    config: dict = {}
+    for col in df.columns:
+        if col == "n" or (col == "T set [°C]" and pd.api.types.is_integer_dtype(df[col])):
+            config[col] = st.column_config.NumberColumn(col, format="%d", width="small")
+        elif col in ("T set [°C]", "T ref [°C]"):
+            config[col] = st.column_config.NumberColumn(col, format="%.3f", width="small")
+        elif pd.api.types.is_float_dtype(df[col]):
+            config[col] = st.column_config.NumberColumn(col, format=value_format, width="small")
+        else:
+            config[col] = st.column_config.TextColumn(col, width="small")
+    return config
+
+
+def _format_remaining(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 5:
+        return "enkele seconden"
+    if seconds < 60:
+        whole = int(round(seconds))
+        return "enkele seconden" if whole < 5 else f"{whole} seconden"
+    minutes = max(1, int(round(seconds / 60.0)))
+    if minutes == 1:
+        return "1 minuut"
+    return f"{minutes} minuten"
+
+
+def _style_judgement(df: pd.DataFrame, columns: list[str], tolerance: float):
+    def paint(value) -> str:
+        mark = judgement_mark(value, tolerance)
+        if mark == "fail":
+            return "background-color: #8B0000; color: #ffffff"
+        if mark == "border":
+            return "background-color: #f6b26b"
+        return ""
+
+    return df.style.map(paint, subset=columns)
+
+
+def _clear_formula_overrides() -> None:
+    """Callback: wist handmatige onzekerheden vóór de fragment-run."""
+    st.session_state["formula_u_override"] = {}
+    st.session_state["judgement_editor_generation"] = int(st.session_state.get("judgement_editor_generation", 0)) + 1
+
+
+def _edited_rows_from_state(state) -> dict[int, dict]:
+    if not isinstance(state, dict):
+        return {}
+    raw = state.get("edited_rows") or {}
+    parsed: dict[int, dict] = {}
+    for key, changes in raw.items():
+        if isinstance(changes, dict):
+            parsed[int(key)] = changes
+    return parsed
+
+
+def _overrides_with_editor(base, formula_per_row: np.ndarray, stored, edits: dict[int, dict]):
+    """Handmatige celwaarden bovenop de formule. Cellen gelijk aan de formule vallen weg."""
+    overrides = filter_uncertainty_overrides(stored, base.row_ids, base.channels)
+    dropped: dict[int, list[str]] = {}
+    for row_index, changes in edits.items():
+        if row_index < 0 or row_index >= len(base.row_ids):
+            continue
+        row_id = base.row_ids[row_index]
+        formula_value = float(formula_per_row[row_index])
+        formula_known = bool(np.isfinite(formula_value))
+        for channel, column in zip(base.channels, base.formula_columns):
+            if column not in changes:
+                continue
+            cell_id = f"{row_id}|{channel}"
+            raw = changes[column]
+            number = None
+            try:
+                if raw is not None and not (isinstance(raw, str) and not str(raw).strip()) and not pd.isna(raw):
+                    number = abs(float(raw))
+            except (TypeError, ValueError):
+                number = None
+            if number is None or not np.isfinite(number):
+                overrides.pop(cell_id, None)
+                dropped.setdefault(row_index, []).append(column)
+                continue
+            if formula_known and abs(number - formula_value) <= 5e-5:
+                overrides.pop(cell_id, None)
+                dropped.setdefault(row_index, []).append(column)
+                continue
+            overrides[cell_id] = number
+    return overrides, dropped
+
+
+def _drop_editor_cells(editor_key: str, dropped: dict[int, list[str]]) -> None:
+    if not dropped or editor_key not in st.session_state:
+        return
+    state = st.session_state.get(editor_key)
+    if not isinstance(state, dict):
+        return
+    edited = {
+        int(key): dict(changes)
+        for key, changes in (state.get("edited_rows") or {}).items()
+        if isinstance(changes, dict)
+    }
+    changed = False
+    for row_index, columns in dropped.items():
+        row = edited.get(int(row_index))
+        if not row:
+            continue
+        for column in columns:
+            if column in row:
+                row.pop(column, None)
+                changed = True
+        if not row:
+            edited.pop(int(row_index), None)
+    if changed:
+        st.session_state[editor_key] = {
+            "edited_rows": edited,
+            "added_rows": list(state.get("added_rows") or []),
+            "deleted_rows": list(state.get("deleted_rows") or []),
+        }
+
+
+@st.fragment
+def _show_beoordeling() -> None:
+    """Alleen dit blok draait opnieuw bij een formule of een cel in de beoordeling."""
+    view = st.session_state.get("beoordeling_view") or {}
+    base = st.session_state.get("assessment_base")
+    token = st.session_state.get("assessment_token")
+
+    st.subheader("Meetonzekerheid van de kalibratie")
+    st.caption(
+        "Schrijf de onzekerheid als functie van de temperatuur T, in °C. "
+        "Voorbeelden: a*T + b en a*e^(-b*T). "
+        "T is de gemiddelde referentietemperatuur van het tijdblok. "
+        "e is het grondtal van de natuurlijke logaritme."
+    )
+    formula_text = st.text_input(
+        "Formule",
+        value="a*T + b",
+        key="uncertainty_formula",
+        help="T is de temperatuur. Coëfficiënten zoals a en b vul je hieronder in. "
+        "Ook geldig: aT+b, a*exp(-b*T) en 0.02*T+0.05.",
+    )
+    parsed_formula = parse_uncertainty_formula(formula_text)
+    coefficients: dict[str, float] = {}
+    if not parsed_formula.ok:
+        st.error(parsed_formula.error)
+    elif parsed_formula.parameters:
+        coef_cols = st.columns(min(len(parsed_formula.parameters), 4))
+        for index, name in enumerate(parsed_formula.parameters):
+            coefficients[name] = coef_cols[index % len(coef_cols)].number_input(
+                name,
+                value=0.0,
+                step=0.001,
+                format="%.6f",
+                key=f"unc_coef_{name}",
+                help="Coëfficiënt in de formule.",
+            )
+    formula_shown = uncertainty_formula_text(parsed_formula, coefficients) if parsed_formula.ok else ""
+    if formula_shown:
+        st.caption(formula_shown)
+
+    if not view.get("time_block_valid", False):
+        st.error("De berekening is ongeldig. Zet de start verder vóór het einde van het setpoint dan het einde.")
+        return
+    if base is None or not base.ready:
+        st.warning("Geen stabiele blokken gevonden. Zonder tijdblokken is er niets te beoordelen.")
+        return
+
+    generation = int(st.session_state.get("judgement_editor_generation", 0))
+    if st.session_state.get("assessment_editor_token") != token:
+        generation += 1
+        st.session_state["judgement_editor_generation"] = generation
+        st.session_state["assessment_editor_token"] = token
+    editor_key = f"judgement_u_editor_{generation}"
+
+    formula_ready = parsed_formula.ok
+    was_negative = False
+    not_finite = False
+    try:
+        formula_per_row, was_negative, not_finite = formula_uncertainty_by_row(
+            base, (lambda temperature: evaluate_uncertainty(parsed_formula, temperature, coefficients)) if formula_ready else None
+        )
+    except UncertaintyFormulaError as exc:
+        formula_ready = False
+        formula_per_row = np.full(len(base.row_ids), np.nan)
+        st.error(str(exc))
+
+    stored_overrides = dict(st.session_state.get("formula_u_override") or {})
+    edits = _edited_rows_from_state(st.session_state.get(editor_key) if editor_key in st.session_state else None)
+    overrides, dropped = _overrides_with_editor(base, formula_per_row, stored_overrides, edits)
+    _drop_editor_cells(editor_key, dropped)
+    st.session_state["formula_u_override"] = overrides
+
+    matrix = apply_uncertainty_overrides(base, formula_per_row, overrides)
+    cache = st.session_state.get("assessment_assembly")
+    previous_u = None
+    previous_tables = None
+    if isinstance(cache, dict) and cache.get("token") == token:
+        previous_u = cache.get("u_cal")
+        previous_tables = cache.get("tables")
+    assessment = assemble_assessment(
+        base,
+        matrix,
+        formula_per_row,
+        was_negative,
+        not_finite,
+        previous_tables,
+        changed_uncertainty_rows(previous_u, matrix),
+    )
+    st.session_state["assessment_assembly"] = {"token": token, "u_cal": matrix, "tables": assessment}
+
+    if assessment.formula_was_negative:
+        st.warning("Een negatieve uitkomst van de formule is als absolute waarde gebruikt.")
+    if assessment.formula_not_finite:
+        st.warning("De formule geeft voor minstens één temperatuur geen eindig getal.")
+
+    st.subheader("Gemeten verschil ΔT")
+    st.caption("Zelfde overzicht als ΔT per kanaal, zonder de tijden. ΔT = PT100 − referentie.")
+    st.dataframe(
+        assessment.delta,
+        width="stretch",
+        hide_index=True,
+        column_config=_assessment_column_config(assessment.delta),
+    )
+
+    st.subheader("Standaardonzekerheid van de meting")
+    st.caption(
+        "Per tijdblok: de standaarddeviatie van ΔT gedeeld door de wortel van het aantal waarnemingen van dat kanaal."
+    )
+    st.dataframe(
+        assessment.u_measurement,
+        width="stretch",
+        hide_index=True,
+        column_config=_assessment_column_config(assessment.u_measurement),
+    )
+
+    if not formula_ready:
+        return
+
+    diff_tol = float(view.get("diff_tol", 0.0))
+    st.subheader("Totale meetonzekerheid")
+    st.caption(
+        "De onzekerheid uit de formule, of de waarde die je in de onderste tabel met de hand invult, "
+        "opgeteld bij de standaardonzekerheid van de meting."
+    )
+    st.dataframe(
+        assessment.u_total,
+        width="stretch",
+        hide_index=True,
+        column_config=_assessment_column_config(assessment.u_total),
+    )
+
+    st.subheader("Beoordeeld verschil")
+    st.caption(
+        "Het gemeten verschil, met de totale meetonzekerheid opgeteld in de richting van de afwijking. "
+        "Een positief verschil wordt hoger, een negatief verschil lager. "
+        f"Donkerrood: groter dan de tolerantie van {diff_tol:g} °C. "
+        "Oranje: grensgeval, vanaf de helft van de tolerantie tot en met de tolerantie. "
+        "Elke kolom u formule staat bij de meetwaarde ernaast en komt uit de formule. "
+        "Pas een cel aan om die meetwaarde een eigen onzekerheid te geven."
+    )
+    if overrides:
+        st.button(
+            "Zet onzekerheden terug naar de formule",
+            key="reset_formula_u",
+            on_click=_clear_formula_overrides,
+        )
+    judged_config = _assessment_column_config(assessment.judged)
+    for column in assessment.formula_columns:
+        judged_config[column] = st.column_config.NumberColumn(
+            column,
+            format="%.4f",
+            min_value=0.0,
+            step=0.0001,
+            help="Onzekerheid uit de formule bij deze meetwaarde. Typ een ander getal om hem met de hand te vullen.",
+        )
+    st.data_editor(
+        _style_judgement(assessment.judged, assessment.judged_columns, diff_tol),
+        width="stretch",
+        hide_index=True,
+        column_config=judged_config,
+        disabled=[column for column in assessment.judged.columns if column not in assessment.formula_columns],
+        key=editor_key,
+    )
+
+    report_assessment_html = build_assessment_report_html(
+        path1_name=str(view.get("label1_name", "")),
+        path2_name=str(view.get("label2_name", "")),
+        ref_label=str(view.get("ref_label", "")),
+        range_start=view.get("range_start"),
+        range_end=view.get("range_end"),
+        laborant=str(view.get("laborant", "")),
+        referentie=str(view.get("referentie", "")),
+        calibrator=str(view.get("calibrator", "")),
+        meetmiddel=str(view.get("meetmiddel", "")),
+        formula_text=formula_shown,
+        diff_tol=diff_tol,
+        tables=assessment,
+        max_rate=float(view.get("max_rate", 0.0)),
+        min_stable=float(view.get("min_stable", 0.0)),
+        calc_start=float(view.get("calc_start", 0.0)),
+        calc_end=float(view.get("calc_end", 0.0)),
+    )
+    report_bytes = report_assessment_html.encode("utf-8-sig")
+    stamp = str(view.get("stamp") or datetime.now().strftime("%Y%m%d_%H%M%S"))
+    html_report_col, word_report_col = st.columns(2)
+    with html_report_col:
+        st.download_button(
+            "Download kalibratierapport (HTML)",
+            data=report_bytes,
+            file_name=f"pt100_kalibratierapport_{stamp}.html",
+            mime="text/html",
+            key="download_assessment_html",
+            help="HTML met de beoordeling. In Word open je dit via Bestand → Openen.",
+        )
+    with word_report_col:
+        st.download_button(
+            "Download kalibratierapport (Word)",
+            data=report_bytes,
+            file_name=f"pt100_kalibratierapport_{stamp}.doc",
+            mime="application/msword",
+            key="download_assessment_doc",
+            help="Hetzelfde rapport. Dit bestand opent direct in Word.",
+        )
 
 
 def _ask_directory(initial: str) -> str:
@@ -905,6 +1243,38 @@ if df2_in_range.empty:
     )
     st.stop()
 
+work_units = max(len(df1_win) + len(df2_in_range), 1)
+previous_seconds = st.session_state.get("last_calc_seconds")
+previous_work = st.session_state.get("last_calc_work")
+if isinstance(previous_seconds, (int, float)) and isinstance(previous_work, (int, float)) and previous_work > 0:
+    expected_seconds = float(previous_seconds) * work_units / float(previous_work)
+else:
+    expected_seconds = None
+if expected_seconds is not None and expected_seconds >= 1:
+    st.toast(f"Bezig met rekenen… nog ongeveer {_format_remaining(expected_seconds)}")
+else:
+    st.toast("Bezig met rekenen…")
+
+calc_popup = st.empty()
+calc_started = time.perf_counter()
+
+
+def _calc_progress(fraction: float, detail: str = "") -> None:
+    fraction = min(max(float(fraction), 0.0), 1.0)
+    elapsed = time.perf_counter() - calc_started
+    if 0.05 < fraction < 0.995 and elapsed >= 0.4:
+        remaining = elapsed * (1.0 - fraction) / fraction
+        text = f"Bezig met rekenen… nog ongeveer {_format_remaining(remaining)}"
+    elif expected_seconds is not None and expected_seconds >= 1 and fraction < 0.995:
+        text = f"Bezig met rekenen… nog ongeveer {_format_remaining(expected_seconds * (1.0 - fraction))}"
+    else:
+        text = "Bezig met rekenen…"
+    if detail:
+        text = f"{text} — {detail}"
+    calc_popup.progress(fraction, text=text)
+
+
+_calc_progress(0.05, "koppelen")
 try:
     merged = merge_measurements(
         df1_win,
@@ -913,15 +1283,18 @@ try:
         pt100_offset_seconds=0.0,
     )
 except Exception as exc:  # noqa: BLE001
+    calc_popup.empty()
     st.error(f"Koppelen van de metingen is mislukt: {exc}")
     st.stop()
 
 if merged.empty:
+    calc_popup.empty()
     st.error(
         "Geen overlappende tijdstippen. Pas de tijdspanne of de tijdoffset aan."
     )
     st.stop()
 
+_calc_progress(0.4, "stabiele blokken")
 if time_block_valid:
     blocks = detect_stable_blocks(
         merged,
@@ -932,9 +1305,11 @@ if time_block_valid:
         min_stable_minutes=float(min_stable),
         calc_start_before_minutes=float(calc_start_before),
         calc_end_before_minutes=float(calc_end_before),
+        progress=lambda fraction, detail: _calc_progress(0.4 + 0.45 * float(fraction), detail),
     )
 else:
     blocks = pd.DataFrame()
+_calc_progress(0.9, "grafieken")
 n_windows = 0 if blocks.empty else int(_unique_windows(blocks).shape[0])
 
 info1, info2, info3, info4 = st.columns(4)
@@ -1032,6 +1407,14 @@ if not blocks.empty:
         margin=dict(t=80, b=40),
     )
 
+_calc_progress(1.0, "")
+calc_elapsed = time.perf_counter() - calc_started
+st.session_state["last_calc_seconds"] = calc_elapsed
+st.session_state["last_calc_work"] = work_units
+calc_popup.empty()
+if calc_elapsed >= 2:
+    st.toast(f"Berekening klaar, in {_format_remaining(calc_elapsed)}.")
+
 report_html = build_report_html(
     path1_name=label1_name,
     path2_name=label2_name,
@@ -1074,8 +1457,32 @@ with html_col:
         help="Grafieken en gemeten verschillen. ΔT is afgerond op 0,01 °C.",
     )
 
-tab_grafiek, tab_tabel, tab_blokken = st.tabs(
-    ["Temperatuur", "Gekoppelde tabel", "Stabiele verschillen"]
+st.session_state["assessment_token"] = int(st.session_state.get("assessment_token", 0)) + 1
+if time_block_valid and not blocks.empty:
+    st.session_state["assessment_base"] = assessment_measurement_base(blocks, selected_channels, pt_labels)
+else:
+    st.session_state["assessment_base"] = None
+st.session_state["beoordeling_view"] = {
+    "time_block_valid": bool(time_block_valid),
+    "diff_tol": float(diff_tol),
+    "label1_name": label1_name,
+    "label2_name": label2_name,
+    "ref_label": ref_label,
+    "range_start": range_start,
+    "range_end": range_end,
+    "laborant": laborant,
+    "referentie": referentie,
+    "calibrator": calibrator,
+    "meetmiddel": meetmiddel,
+    "max_rate": float(max_rate),
+    "min_stable": float(min_stable),
+    "calc_start": float(calc_start_before),
+    "calc_end": float(calc_end_before),
+    "stamp": stamp,
+}
+
+tab_grafiek, tab_tabel, tab_blokken, tab_beoordeling = st.tabs(
+    ["Temperatuur", "Gekoppelde tabel", "Stabiele verschillen", "Beoordeling"]
 )
 
 with tab_grafiek:
@@ -1150,3 +1557,6 @@ with tab_blokken:
         if fig_blocks is not None:
             st.caption("Beweeg over een lijn om dat kanaal uit te lichten.")
             _plotly_hover_chart(fig_blocks, div_id="delta_setpoints_app", height=500)
+
+with tab_beoordeling:
+    _show_beoordeling()
