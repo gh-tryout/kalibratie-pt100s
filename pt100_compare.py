@@ -169,6 +169,109 @@ def _is_pt100_text(text: str) -> bool:
     )
 
 
+_CHROMA_CHANNEL = re.compile(r"^CH\s*(\d+)$", re.IGNORECASE)
+
+
+def _is_chroma_text(text: str) -> bool:
+    head = text[:12000].lower()
+    return "chroma logger" in head or ("***** data *****" in head and re.search(r"\bch\d+\b", head) is not None)
+
+
+def _chroma_channel_id(name: str) -> str:
+    match = _CHROMA_CHANNEL.match(name.strip())
+    if not match:
+        return name.strip()
+    return f"CH{int(match.group(1))}"
+
+
+def _chroma_sensor_labels(lines: list[str], header_idx: int) -> dict[str, str]:
+    """Sensor Type uit de Chroma-instellingen, gekoppeld aan CHn."""
+    channel_parts: list[str] | None = None
+    for raw in lines[:header_idx]:
+        parts = [part.strip() for part in next(csv.reader([raw]))]
+        if sum(1 for part in parts if _CHROMA_CHANNEL.match(part)) >= 1:
+            channel_parts = parts
+    if not channel_parts:
+        return {}
+    for raw in lines[:header_idx]:
+        parts = [part.strip() for part in next(csv.reader([raw]))]
+        if not any(part.lower().startswith("sensor") for part in parts):
+            continue
+        labels: dict[str, str] = {}
+        for index, name in enumerate(channel_parts):
+            if not _CHROMA_CHANNEL.match(name) or index >= len(parts):
+                continue
+            sensor = parts[index].strip()
+            if not sensor or sensor.lower() in {"disable", "none"}:
+                continue
+            channel = _chroma_channel_id(name)
+            labels[channel] = f"{channel} {sensor}"
+        return labels
+    return {}
+
+
+def _load_chroma_csv(path: str | Path) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
+    """Lees een Chroma Logger-export: Date, Time en kanalen CH1, CH2, ..."""
+    path = Path(path)
+    text = _read_text(path)
+    lines = text.splitlines()
+    header_idx = None
+    for index, line in enumerate(lines):
+        low = line.lower().lstrip()
+        if low.startswith("date,time") or low.startswith("date;time"):
+            header_idx = index
+            break
+    if header_idx is None:
+        raise ValueError(f"Chroma-bestand mist de datakop (Date, Time, kanalen): {path.name}")
+
+    data_lines: list[str] = []
+    for line in lines[header_idx:]:
+        if line.strip().lower().startswith("****"):
+            break
+        data_lines.append(line)
+    separator = ";" if data_lines[0].count(";") > data_lines[0].count(",") else ","
+    table = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=separator, engine="python")
+    table.columns = [str(column).strip() for column in table.columns]
+    table = table.loc[:, [column for column in table.columns if column and not str(column).lower().startswith("unnamed")]]
+
+    date_col = next((column for column in table.columns if column.lower() == "date"), None)
+    time_col = next((column for column in table.columns if column.lower() == "time"), None)
+    if date_col is None or time_col is None:
+        raise ValueError(f"Chroma-bestand mist Date of Time: {path.name}")
+
+    sensor_labels = _chroma_sensor_labels(lines, header_idx)
+    channel_cols: list[tuple[str, str]] = []
+    for column in table.columns:
+        low = column.lower()
+        if low in {date_col.lower(), time_col.lower(), "event"} or low.startswith("tick"):
+            continue
+        if not _CHROMA_CHANNEL.match(column):
+            continue
+        channel_cols.append((_chroma_channel_id(column), column))
+    if not channel_cols:
+        raise ValueError(f"Chroma-bestand mist temperatuurkanalen: {path.name}")
+    if len(channel_cols) > MAX_PT100_CHANNELS:
+        channel_cols = channel_cols[:MAX_PT100_CHANNELS]
+
+    combined = table[date_col].map(lambda value: "" if pd.isna(value) else str(value).strip())
+    combined = combined + " " + table[time_col].map(lambda value: "" if pd.isna(value) else str(value).strip())
+    tijd = _parse_datetime_series(combined)
+    data: dict[str, pd.Series] = {"tijd": tijd}
+    for channel, column in channel_cols:
+        values = _to_float(table[column])
+        data[channel] = values.where(values.abs() < OPEN_ABS_LIMIT)
+
+    out = pd.DataFrame(data)
+    valid_idx = np.flatnonzero(out["tijd"].notna().to_numpy()).astype(np.intp)
+    if valid_idx.size == 0:
+        raise ValueError(f"Chroma-bestand heeft geen leesbare tijdstippen: {path.name}")
+    out = pd.DataFrame({col: out[col].to_numpy().take(valid_idx) for col in out.columns})
+    out = out.sort_values("tijd").drop_duplicates(subset=["tijd"]).reset_index(drop=True)
+    channels = [channel for channel, _column in channel_cols]
+    labels = {channel: sensor_labels.get(channel, channel) for channel in channels}
+    return out, channels, labels
+
+
 def _load_pt100_csv(path: str | Path) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
     """Lees een Keysight-scan (max. 20 PT100-kanalen). Open kanalen worden NaN."""
     path = Path(path)
@@ -237,7 +340,7 @@ def classify_file(path: str | Path) -> str:
         text = _read_text(path)
     except OSError as exc:
         raise ValueError(f"Kan bestand niet lezen: {path.name}") from exc
-    if _is_pt100_text(text):
+    if _is_pt100_text(text) or _is_chroma_text(text):
         return "pt100"
     return "onbekend"
 
@@ -250,12 +353,16 @@ def load_measurement(path: str | Path) -> tuple[str, pd.DataFrame, list[str], di
         frame, channels, labels = _load_reference_dbf(path)
         return kind, frame, channels, labels
     if kind == "pt100":
-        frame, channels, labels = _load_pt100_csv(path)
+        text = _read_text(path)
+        if _is_chroma_text(text):
+            frame, channels, labels = _load_chroma_csv(path)
+        else:
+            frame, channels, labels = _load_pt100_csv(path)
         return kind, frame, channels, labels
     raise ValueError(
         f"Bestandstype niet herkend: {path.name}. "
         "Bestand 1 is een DBF van de referentie-meter. "
-        "Bestand 2 is een PT100-scan (CSV) of een tweede referentie-DBF."
+        "Bestand 2 is een PT100-scan, een Chroma-logger (CSV) of een tweede referentie-DBF."
     )
 
 
@@ -389,6 +496,8 @@ def _parse_datetime_series(values: pd.Series) -> pd.Series:
         "%Y-%m-%d %H:%M:%S.%f",
         "%d-%m-%Y %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S.%f",
+        "%Y/%m/%d %H:%M:%S.%f",
         "%d/%m/%Y %H:%M:%S",
         "%Y/%m/%d %H:%M:%S",
         "%d-%m-%Y %H:%M",

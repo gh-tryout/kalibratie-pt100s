@@ -859,7 +859,7 @@ with st.sidebar:
             type=["csv", "txt", "dat", "dbf"],
             key="upload_file_2",
             accept_multiple_files=True,
-            help="CSV: PT100-scan. Hetzelfde kanaalnummer wordt één kanaal. "
+            help="CSV: PT100-scan of Chroma-logger. Hetzelfde kanaalnummer wordt één kanaal. "
             "DBF: tweede referentie, verder behandeld als één meetkanaal.",
         )
         if up1 is not None:
@@ -1181,7 +1181,7 @@ for source in sources:
     elif kind2 != "pt100":
         st.error(
             f"{source_name} is geen PT100-scan en geen referentie-DBF. "
-            "Gebruik een Keysight-export of een tweede referentiebestand."
+            "Gebruik een Keysight-export, een Chroma-logger of een tweede referentiebestand."
         )
         st.stop()
     else:
