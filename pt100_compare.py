@@ -1672,3 +1672,33 @@ def build_assessment_report_html(
 </body>
 </html>
 """
+
+
+def build_calibration_excel(
+    *,
+    info_rows: list[tuple[str, str]],
+    coupled: pd.DataFrame | None,
+    overview: pd.DataFrame | None,
+    details: pd.DataFrame | None,
+    u_measurement: pd.DataFrame | None,
+    u_total: pd.DataFrame | None,
+    judged: pd.DataFrame | None,
+) -> bytes:
+    """Excel met de intro van het kalibratierapport en de tabellen uit de app."""
+    rows = list(info_rows)
+    rows.append(("Gegenereerd", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    info = pd.DataFrame(rows, columns=["Onderdeel", "Waarde"])
+    sheets = (
+        ("info", info),
+        ("gekoppelde tabel", coupled if coupled is not None else pd.DataFrame()),
+        ("overzicht dT per kanaal", overview if overview is not None else pd.DataFrame()),
+        ("details per blok", details if details is not None else pd.DataFrame()),
+        ("standaardonzekerheid", u_measurement if u_measurement is not None else pd.DataFrame()),
+        ("totale meetonzekerheid", u_total if u_total is not None else pd.DataFrame()),
+        ("beoordeeld verschil", judged if judged is not None else pd.DataFrame()),
+    )
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for name, frame in sheets:
+            frame.to_excel(writer, sheet_name=name, index=False)
+    return buffer.getvalue()

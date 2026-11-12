@@ -51,6 +51,7 @@ try:
     assemble_assessment = _pt100_compare.assemble_assessment
     judgement_mark = _pt100_compare.judgement_mark
     build_assessment_report_html = _pt100_compare.build_assessment_report_html
+    build_calibration_excel = _pt100_compare.build_calibration_excel
     UncertaintyFormulaError = _pt100_compare.UncertaintyFormulaError
 except Exception:
     st.set_page_config(page_title="PT100-kalibratie", layout="wide")
@@ -354,6 +355,74 @@ def _drop_editor_cells(editor_key: str, dropped: dict[int, list[str]]) -> None:
         }
 
 
+def _excel_info_rows(view: dict, formula_text: str, notes: list[str]) -> list[tuple[str, str]]:
+    """Zelfde intro als het Word-rapport, zonder het tijdstip van genereren."""
+
+    def show(value) -> str:
+        text = "" if value is None else str(value).strip()
+        return text or "—"
+
+    max_rate = float(view.get("max_rate", 0.0))
+    min_stable = float(view.get("min_stable", 0.0))
+    calc_start = float(view.get("calc_start", 0.0))
+    calc_end = float(view.get("calc_end", 0.0))
+    diff_tol = float(view.get("diff_tol", 0.0))
+    rows = [
+        ("Rapport", "Kalibratierapport PT100"),
+        ("Laborant", show(view.get("laborant"))),
+        ("Referentie", show(view.get("referentie"))),
+        ("Calibrator", show(view.get("calibrator"))),
+        ("Gekalibreerd meetmiddel", show(view.get("meetmiddel"))),
+        (
+            "Bestand 1 (referentie)",
+            f"{show(view.get('label1_name'))} · kanaal {show(view.get('ref_label'))}",
+        ),
+        ("Meting", show(view.get("label2_name"))),
+        ("Tijdspanne", f"{show(view.get('range_start'))} → {show(view.get('range_end'))}"),
+        ("Tolerantie verschil", f"{diff_tol:g} °C"),
+        (
+            "Tijdblok",
+            "einde zodra de referentie sneller dan "
+            f"{max_rate:g} K/min verandert, na minstens {min_stable:g} min stabiel. "
+            f"Gemiddelde van {calc_start:g} tot {calc_end:g} min vóór dat einde.",
+        ),
+        ("Meetonzekerheid kalibratie", formula_text.strip() or "u = 0"),
+    ]
+    for note in notes:
+        rows.append(("Opmerking", note))
+    return rows
+
+
+def _publish_excel_tables(
+    view: dict,
+    formula_text: str,
+    notes: list[str],
+    u_measurement: pd.DataFrame | None = None,
+    u_total: pd.DataFrame | None = None,
+    judged: pd.DataFrame | None = None,
+) -> None:
+    """Werk het Excel-pakket bij. De downloadknop leest dit pakket pas bij een klik."""
+    box = st.session_state.get("excel_box")
+    if not isinstance(box, dict):
+        return
+    box["info_rows"] = _excel_info_rows(view, formula_text, notes)
+    box["u_measurement"] = u_measurement if u_measurement is not None else pd.DataFrame()
+    box["u_total"] = u_total if u_total is not None else pd.DataFrame()
+    box["judged"] = judged if judged is not None else pd.DataFrame()
+
+
+def _download_from_excel_box(box: dict) -> bytes:
+    return build_calibration_excel(
+        info_rows=list(box.get("info_rows") or []),
+        coupled=box.get("coupled"),
+        overview=box.get("overview"),
+        details=box.get("details"),
+        u_measurement=box.get("u_measurement"),
+        u_total=box.get("u_total"),
+        judged=box.get("judged"),
+    )
+
+
 @st.fragment
 def _show_beoordeling() -> None:
     """Alleen dit blok draait opnieuw bij een formule of een cel in de beoordeling."""
@@ -395,9 +464,11 @@ def _show_beoordeling() -> None:
         st.caption(formula_shown)
 
     if not view.get("time_block_valid", False):
+        _publish_excel_tables(view, formula_shown, [])
         st.error("De berekening is ongeldig. Zet de start verder vóór het einde van het setpoint dan het einde.")
         return
     if base is None or not base.ready:
+        _publish_excel_tables(view, formula_shown, [])
         st.warning("Geen stabiele blokken gevonden. Zonder tijdblokken is er niets te beoordelen.")
         return
 
@@ -443,6 +514,19 @@ def _show_beoordeling() -> None:
         changed_uncertainty_rows(previous_u, matrix),
     )
     st.session_state["assessment_assembly"] = {"token": token, "u_cal": matrix, "tables": assessment}
+    notes: list[str] = []
+    if assessment.formula_was_negative:
+        notes.append("Een negatieve uitkomst van de formule is als absolute waarde gebruikt.")
+    if assessment.formula_not_finite:
+        notes.append("Voor minstens één temperatuur gaf de formule geen eindig getal.")
+    _publish_excel_tables(
+        view,
+        formula_shown,
+        notes,
+        assessment.u_measurement,
+        assessment.u_total if formula_ready else pd.DataFrame(),
+        assessment.judged if formula_ready else pd.DataFrame(),
+    )
 
     if assessment.formula_was_negative:
         st.warning("Een negatieve uitkomst van de formule is als absolute waarde gebruikt.")
@@ -1437,7 +1521,15 @@ report_html = build_report_html(
     meetmiddel=meetmiddel,
 )
 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-csv_col, html_col = st.columns(2)
+excel_box = st.session_state.setdefault("excel_box", {})
+if not isinstance(excel_box, dict):
+    excel_box = {}
+    st.session_state["excel_box"] = excel_box
+
+def _serve_excel(box: dict = excel_box) -> bytes:
+    return _download_from_excel_box(box)
+
+csv_col, html_col, excel_col = st.columns(3)
 with csv_col:
     st.download_button(
         "Download gekoppelde tabel (CSV)",
@@ -1455,6 +1547,17 @@ with html_col:
         mime="text/html",
         key="download_report_html",
         help="Grafieken en gemeten verschillen. ΔT is afgerond op 0,01 °C.",
+    )
+with excel_col:
+    st.download_button(
+        "Genereer excel",
+        data=_serve_excel,
+        file_name=f"pt100_kalibratie_{stamp}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_excel",
+        on_click="ignore",
+        help="Maakt bij een klik een Excel-bestand. Het eerste tabblad is de intro van het Word-rapport. "
+        "Daarna volgen de gekoppelde tabel, het overzicht, de blokdetails en de beoordeling.",
     )
 
 st.session_state["assessment_token"] = int(st.session_state.get("assessment_token", 0)) + 1
@@ -1480,6 +1583,18 @@ st.session_state["beoordeling_view"] = {
     "calc_end": float(calc_end_before),
     "stamp": stamp,
 }
+excel_box.clear()
+excel_box.update(
+    {
+        "info_rows": _excel_info_rows(st.session_state["beoordeling_view"], "", []),
+        "coupled": display_df,
+        "overview": wide_display,
+        "details": block_display,
+        "u_measurement": pd.DataFrame(),
+        "u_total": pd.DataFrame(),
+        "judged": pd.DataFrame(),
+    }
+)
 
 tab_grafiek, tab_tabel, tab_blokken, tab_beoordeling = st.tabs(
     ["Temperatuur", "Gekoppelde tabel", "Stabiele verschillen", "Beoordeling"]
